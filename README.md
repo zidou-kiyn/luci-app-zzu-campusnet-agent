@@ -37,6 +37,27 @@
 
 ---
 
+## 安装方法零：从 Release 下载安装包（推荐）
+
+[Releases](https://github.com/zidou-kiyn/luci-app-zzu-campusnet-agent/releases) 页面提供编译好的安装包。本插件**架构无关**（纯脚本），同一个包适用于所有平台，按系统版本选格式：
+
+| 你的系统 | 包格式 | 安装命令 |
+|----------|--------|----------|
+| ImmortalWrt 25.12 / snapshot（新版，apk） | `*.apk` | `apk add --allow-untrusted /tmp/luci-app-zzu-campusnet-agent-*.apk` |
+| ImmortalWrt 24.10 及更早（opkg） | `*.ipk` | `opkg install /tmp/luci-app-zzu-campusnet-agent_*_all.ipk` |
+
+> 不确定用哪个？SSH 执行 `which apk` 有输出就用 apk，否则用 ipk。
+> apk 包为本地编译、无官方签名，所以需要 `--allow-untrusted`。
+
+```sh
+# 示例：下载后传到路由器再安装
+scp luci-app-zzu-campusnet-agent-*.apk root@192.168.1.1:/tmp/
+ssh root@192.168.1.1
+apk add --allow-untrusted /tmp/luci-app-zzu-campusnet-agent-*.apk
+```
+
+---
+
 ## 安装（一键脚本，无需编译）
 
 1. 把 `install.sh` 传到路由器（任选一种）：

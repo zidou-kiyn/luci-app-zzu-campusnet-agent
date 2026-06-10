@@ -1,0 +1,90 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG_NAME: luci-app-zzu-campusnet-agent
+
+jobs:
+  build:
+    name: ${{ matrix.format }} (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ipk:opkg 包管理器,ImmortalWrt 24.10 及更早版本(架构无关,全平台通用)
+          - format: ipk
+            branch: openwrt-24.10
+            image: immortalwrt/sdk:x86-64-openwrt-24.10
+          # apk:新版包管理器,ImmortalWrt 25.12 / snapshot(架构无关,全平台通用)
+          - format: apk
+            branch: openwrt-25.12
+            image: immortalwrt/sdk:x86-64-openwrt-25.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with ImmortalWrt SDK (${{ matrix.image }})
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/out:/out" \
+            -e PKG_NAME="$PKG_NAME" \
+            "${{ matrix.image }}" \
+            /bin/sh /src/.github/sdk-build.sh
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.format }}-${{ matrix.branch }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add install.sh & checksums
+        run: |
+          cp install.sh dist/
+          cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            郑大校园网认证 LuCI 插件(架构无关,所有平台通用)。三种安装方式任选其一:
+
+            ### 1. apk 包 —— ImmortalWrt 25.12 / snapshot(新版,默认 apk 包管理器)
+            ```sh
+            apk add --allow-untrusted /tmp/luci-app-zzu-campusnet-agent-*.apk
+            ```
+            > 本地编译的包没有官方签名,需加 `--allow-untrusted`。
+
+            ### 2. ipk 包 —— ImmortalWrt 24.10 及更早(opkg 包管理器)
+            ```sh
+            opkg install /tmp/luci-app-zzu-campusnet-agent_*_all.ipk
+            ```
+
+            ### 3. install.sh 一键脚本 —— 任意版本,无需包管理器
+            ```sh
+            sh /tmp/install.sh            # 安装 / 更新
+            sh /tmp/install.sh uninstall  # 卸载
+            ```
+
+            安装后打开 LuCI → 服务 → ZZU CampusNet Agent。校验和见 `sha256sums.txt`。
