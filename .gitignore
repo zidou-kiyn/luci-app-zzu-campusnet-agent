@@ -11,8 +11,10 @@ __pycache__/
 
 # OpenWrt 构建产物
 *.ipk
+*.apk
 /bin/
 /build/
+dist/
 
 # 编辑器 / IDE
 .vscode/
