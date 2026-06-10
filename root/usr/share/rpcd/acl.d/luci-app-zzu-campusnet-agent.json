@@ -1,0 +1,17 @@
+{
+	"luci-app-zzu-campusnet-agent": {
+		"description": "Grant access to ZZU campus network status & auth",
+		"read": {
+			"ubus": {
+				"luci.zzucampusnetagent": [ "query", "login", "logout" ]
+			},
+			"uci": [ "zzucampusnetagent" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.zzucampusnetagent": [ "login", "logout" ]
+			},
+			"uci": [ "zzucampusnetagent" ]
+		}
+	}
+}

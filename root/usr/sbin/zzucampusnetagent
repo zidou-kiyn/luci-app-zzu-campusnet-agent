@@ -1,0 +1,170 @@
+#!/bin/sh
+# zzucampusnetagent - 郑大校园网 eportal 命令行核心
+# 用法: zzucampusnetagent {query|login|logout|reauth}
+. /usr/share/libubox/jshn.sh
+
+CFG="zzucampusnetagent"
+cfg() { uci -q get "${CFG}.config.$1" 2>/dev/null; }
+base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
+
+isp_suffix() {
+	case "$1" in
+		cmcc)    echo "@cmcc" ;;
+		unicom)  echo "@unicom" ;;
+		telecom) echo "@telecom" ;;
+		zzuplan) echo "@zzuplan" ;;
+		campus|"") echo "" ;;
+		@*)      echo "$1" ;;
+		*)       echo "@$1" ;;
+	esac
+}
+
+urlencode() {
+	S="$1" awk 'BEGIN{
+		s=ENVIRON["S"]
+		for(i=0;i<256;i++)O[sprintf("%c",i)]=i
+		h="0123456789ABCDEF"; n=length(s); o=""
+		for(i=1;i<=n;i++){c=substr(s,i,1)
+			if(c ~ /[A-Za-z0-9._~-]/){o=o c}
+			else{v=O[c];o=o "%" substr(h,int(v/16)+1,1) substr(h,(v%16)+1,1)}
+		}
+		printf "%s",o
+	}'
+}
+
+b64() {
+	if command -v openssl >/dev/null 2>&1; then
+		printf '%s' "$1" | openssl enc -base64 -A 2>/dev/null
+	elif printf '' | base64 >/dev/null 2>&1; then
+		printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'
+	else
+		S="$1" awk 'BEGIN{
+			s=ENVIRON["S"]
+			for(i=0;i<256;i++)O[sprintf("%c",i)]=i
+			b="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+			n=length(s); o=""
+			for(i=1;i<=n;i+=3){
+				c1=O[substr(s,i,1)]
+				c2=(i+1<=n)?O[substr(s,i+1,1)]:0
+				c3=(i+2<=n)?O[substr(s,i+2,1)]:0
+				o=o substr(b,int(c1/4)+1,1)
+				o=o substr(b,(int(c1%4)*16+int(c2/16))+1,1)
+				o=o ((i+1<=n)?substr(b,(int(c2%16)*4+int(c3/64))+1,1):"=")
+				o=o ((i+2<=n)?substr(b,(c3%64)+1,1):"=")
+			}
+			printf "%s",o
+		}'
+	fi
+}
+
+fetch() {
+	local ref ua
+	ref="http://$(base)/"
+	ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+	if command -v curl >/dev/null 2>&1; then
+		curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
+	elif command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -T 8 -U "$ua" -O - "$1" 2>/dev/null
+	else
+		wget -q -O - "$1" 2>/dev/null
+	fi
+}
+
+strip_jsonp() { echo "$1" | sed -e 's/^[^(]*(//' -e 's/)[^)]*$//'; }
+
+cmd_query() {
+	local raw json result msg
+	raw=$(fetch "http://$(base):801/eportal/portal/custom")
+	json_init
+	json_add_int ts "$(date +%s)"
+	if [ -z "$raw" ]; then
+		json_add_string status "error"
+		json_add_string msg "无法连接认证服务器（确认路由器已接入校园网）"
+		json_dump; return
+	fi
+	json=$(strip_jsonp "$raw")
+	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
+	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
+	if [ "$result" = "1" ]; then
+		json_add_string status "online"
+		json_add_string msg "${msg:-在线}"
+		json_add_string account  "$(jsonfilter -s "$json" -e '@.data.param_account'  2>/dev/null)"
+		json_add_string carrier  "$(jsonfilter -s "$json" -e '@.data.param_exit'     2>/dev/null)"
+		json_add_string duration "$(jsonfilter -s "$json" -e '@.data.param_duration' 2>/dev/null)"
+		json_add_string ip       "$(jsonfilter -s "$json" -e '@.data.param_ip'       2>/dev/null)"
+	elif [ "$result" = "0" ]; then
+		json_add_string status "offline"
+		json_add_string msg "${msg:-当前无在线信息（可能未登录）}"
+	else
+		json_add_string status "error"
+		json_add_string msg "${msg:-接口返回异常}"
+	fi
+	json_dump
+}
+
+query_state() {
+	local raw json
+	raw=$(fetch "http://$(base):801/eportal/portal/custom")
+	[ -z "$raw" ] && { echo "error"; return; }
+	json=$(strip_jsonp "$raw")
+	case "$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)" in
+		1) echo "online" ;; 0) echo "offline" ;; *) echo "error" ;;
+	esac
+}
+
+cmd_login() {
+	local account password isp suffix acct pwb64 url raw json result msg
+	account=$(cfg account); password=$(cfg password); isp=$(cfg isp)
+	suffix=$(isp_suffix "$isp")
+	json_init
+	json_add_int ts "$(date +%s)"
+	if [ -z "$account" ] || [ -z "$password" ]; then
+		json_add_int result 0
+		json_add_string msg "请先在下方设置账号和密码并保存"
+		json_dump; return
+	fi
+	acct=$(urlencode ",0,${account}${suffix}")
+	pwb64=$(urlencode "$(b64 "$password")")
+	url="http://$(base):801/eportal/portal/login?user_account=${acct}&user_password=${pwb64}"
+	raw=$(fetch "$url")
+	json=$(strip_jsonp "$raw")
+	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
+	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
+	json_add_int result "${result:-0}"
+	json_add_string msg "${msg:-登录请求失败（检查网络/服务器地址）}"
+	json_dump
+}
+
+cmd_logout() {
+	local raw json result msg
+	raw=$(fetch "http://$(base):801/eportal/portal/logout")
+	json=$(strip_jsonp "$raw")
+	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
+	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_int result "${result:-0}"
+	json_add_string msg "${msg:-注销请求失败}"
+	json_dump
+}
+
+cmd_reauth() {
+	local st
+	logger -t zzucampusnetagent "scheduled re-auth start"
+	st=$(query_state)
+	if [ "$st" = "online" ]; then
+		cmd_logout >/dev/null 2>&1
+		logger -t zzucampusnetagent "logout done, sleep 1s then login"
+		sleep 1
+	fi
+	cmd_login >/dev/null 2>&1
+	logger -t zzucampusnetagent "scheduled re-auth finished (was: $st)"
+}
+
+case "$1" in
+	query)  cmd_query ;;
+	login)  cmd_login ;;
+	logout) cmd_logout ;;
+	reauth) cmd_reauth ;;
+	*) echo "usage: $0 {query|login|logout|reauth}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+CRON="/etc/crontabs/root"
+TAG="# zzucampusnetagent-reauth"
+
+sync_cron() {
+	local enabled time hour min
+	enabled=$(uci -q get zzucampusnetagent.config.auto_relogin)
+	time=$(uci -q get zzucampusnetagent.config.relogin_time)
+	[ -z "$time" ] && time="06:00"
+	hour=${time%%:*}; min=${time##*:}
+	[ -z "$hour" ] && hour=6
+	[ -z "$min" ]  && min=0
+	hour=$(printf '%d' "$hour" 2>/dev/null || echo 6)
+	min=$(printf '%d' "$min" 2>/dev/null || echo 0)
+	mkdir -p /etc/crontabs
+	[ -f "$CRON" ] || touch "$CRON"
+	sed -i "\|$TAG|d" "$CRON"
+	if [ "$enabled" = "1" ]; then
+		echo "$min $hour * * * /usr/sbin/zzucampusnetagent reauth >/dev/null 2>&1 $TAG" >> "$CRON"
+		/etc/init.d/cron enable >/dev/null 2>&1
+	fi
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+
+start_service()  { sync_cron; }
+reload_service() { sync_cron; }
+boot()           { sync_cron; }
+
+stop_service() {
+	[ -f "$CRON" ] && sed -i "\|$TAG|d" "$CRON"
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+
+service_triggers() {
+	procd_add_reload_trigger "zzucampusnetagent"
+}

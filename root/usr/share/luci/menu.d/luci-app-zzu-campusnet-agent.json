@@ -1,0 +1,13 @@
+{
+	"admin/services/zzucampusnetagent": {
+		"title": "ZZU CampusNet Agent",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "zzucampusnetagent/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-zzu-campusnet-agent" ]
+		}
+	}
+}

@@ -1,0 +1,31 @@
+# Claude Code / OMC 工具状态目录（任意层级）
+.claude/
+.omc/
+
+# 抓包参考数据（含真实账号与密码，请勿提交）
+raw_http/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OpenWrt 构建产物
+*.ipk
+/bin/
+/build/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,16 @@
+#!/bin/sh
+BIN="/usr/sbin/zzucampusnetagent"
+case "$1" in
+	list)
+		echo '{ "query": { }, "login": { }, "logout": { } }'
+		;;
+	call)
+		read -r _ 2>/dev/null
+		case "$2" in
+			query)  "$BIN" query ;;
+			login)  "$BIN" login ;;
+			logout) "$BIN" logout ;;
+			*) echo '{}' ;;
+		esac
+		;;
+esac

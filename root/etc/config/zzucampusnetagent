@@ -1,0 +1,7 @@
+config zzucampusnetagent 'config'
+	option baseurl '172.16.4.14'
+	option account ''
+	option password ''
+	option isp 'campus'
+	option auto_relogin '0'
+	option relogin_time '06:00'
