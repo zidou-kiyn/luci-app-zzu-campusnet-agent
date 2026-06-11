@@ -25,6 +25,20 @@ rm -rf "package/$PKG_NAME"
 mkdir -p "package/$PKG_NAME"
 cp -r /src/Makefile /src/htdocs /src/root "package/$PKG_NAME/"
 
+# 用 CI 传入的版本号(来自 git tag,如 v1.0.1 → 1.0.1)覆盖 Makefile 里写死的
+# PKG_VERSION,使产物文件名跟随标签;workflow_dispatch 等无 tag 场景留空,沿用默认值。
+# 改的是拷进 SDK 的副本(可写),/src 仍只读不动。
+if [ -n "${PKG_VERSION:-}" ]; then
+	sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${PKG_VERSION}/" "package/$PKG_NAME/Makefile"
+	grep '^PKG_VERSION:=' "package/$PKG_NAME/Makefile"
+fi
+
+# 强制给随包脚本加可执行位(双保险):rpcd 只加载带执行权限的插件,
+# 否则前端 RPC 调用会报 -32000 Object not found;此处不依赖 git 是否保留 mode。
+chmod 0755 "package/$PKG_NAME/root/usr/libexec/rpcd/luci.zzucampusnetagent" \
+           "package/$PKG_NAME/root/usr/sbin/zzucampusnetagent" \
+           "package/$PKG_NAME/root/etc/init.d/zzucampusnetagent"
+
 # luci.mk 与 luci-base 依赖来自 luci feed
 ./scripts/feeds update luci
 ./scripts/feeds install -p luci luci-base

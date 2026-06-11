@@ -31,12 +31,21 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Build with ImmortalWrt SDK (${{ matrix.image }})
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           mkdir -p out && chmod 777 out
+          # 仅 tag 触发时取版本号:v1.0.1 → 1.0.1;其余(如 workflow_dispatch)留空走 Makefile 默认值
+          PKG_VERSION=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            PKG_VERSION="${REF_NAME#v}"
+          fi
           docker run --rm \
             -v "$PWD:/src:ro" \
             -v "$PWD/out:/out" \
             -e PKG_NAME="$PKG_NAME" \
+            -e PKG_VERSION="$PKG_VERSION" \
             "${{ matrix.image }}" \
             /bin/sh /src/.github/sdk-build.sh
           ls -l out
