@@ -43,6 +43,18 @@ chmod 0755 "package/$PKG_NAME/root/usr/libexec/rpcd/luci.zzucampusnetagent" \
 ./scripts/feeds update luci
 ./scripts/feeds install -p luci luci-base
 
+# 绕过 csstidy 源下载校验失败:构建任何 luci 包都会 host 编译 csstidy 工具,
+# 它先从镜像源拉取 csstidy-1.1.0.tar.zst。25.12/snapshot 镜像尚未缓存该包(全部 404),
+# 退回 git clone 本地重打包时,因 git archive / zstd 版本差异生成的字节与 feed 内置
+# PKG_MIRROR_HASH 不符(构建日志提示 "probably caused by .gitattributes")而报错。
+# 源码内容一致、仅压缩字节不同,故将其下载校验置为 skip 接受 git 回退产物。
+# 对 24.10 镜像可正常下载的场景无副作用(skip 仅跳过校验)。本包无 CSS,不依赖 csstidy 产物。
+CSSTIDY_MK="feeds/luci/contrib/package/csstidy/Makefile"
+if [ -f "$CSSTIDY_MK" ]; then
+	sed -i 's/^PKG_MIRROR_HASH[[:space:]]*:=.*/PKG_MIRROR_HASH:=skip/; s/^PKG_HASH[[:space:]]*:=.*/PKG_HASH:=skip/' "$CSSTIDY_MK"
+	grep -E '^PKG_(MIRROR_)?HASH:=' "$CSSTIDY_MK" || true
+fi
+
 make defconfig
 make "package/$PKG_NAME/compile" -j"$(nproc)" V=s
 
