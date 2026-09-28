@@ -1,0 +1,30 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/99-multipath
+# 电信组 (main): wanct + wanbt 多路负载均衡
+# 移动组 (cmcc): wancm + wancm2 多路负载均衡
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+
+GW=10.172.255.254
+
+build() {
+    local tbl="$1"; shift
+    local NH="" n=0
+    while [ "$#" -ge 1 ]; do
+        local dev="$1"; shift
+        ip link show "$dev" up >/dev/null 2>&1 || continue
+        local myip
+        myip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}' | cut -d/ -f1)
+        [ -z "$myip" ] && continue
+        NH="$NH nexthop via $GW dev $dev weight 1"
+        n=$((n + 1))
+    done
+    [ $n -eq 0 ] && return
+    ip route del default table "$tbl" 2>/dev/null
+    eval ip route add default table "$tbl" $NH 2>/dev/null
+    logger -t multipath "$tbl: $n path(s)"
+}
+
+case "$INTERFACE" in
+    wan|wanbt)    build main wanct wanbt ;;
+    wancm|wancm2) build cmcc wancm wancm2 ;;
+esac
