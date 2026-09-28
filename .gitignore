@@ -5,6 +5,9 @@
 # 抓包参考数据（含真实账号与密码，请勿提交）
 raw_http/
 
+# UI 设计稿 / 预览（本地工作文件）
+design/
+
 # Python
 __pycache__/
 *.py[cod]
