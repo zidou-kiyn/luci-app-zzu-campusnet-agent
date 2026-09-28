@@ -294,6 +294,13 @@ return view.extend({
         o = ls.option(form.Value, 'name', '名称');
         o.placeholder = '如：移动下载';
 
+        o = ls.option(form.Value, 'account', '账号', '留空 = 用主账号');
+        o.placeholder = '同主账号';
+
+        o = ls.option(form.Value, 'password', '密码', '留空 = 用主密码');
+        o.password = true;
+        o.placeholder = '同主密码';
+
         o = ls.option(widgets.NetworkSelect, 'iface', '出口接口');
         o.nocreate = true;
         o.rmempty = false;
