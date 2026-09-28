@@ -3,21 +3,24 @@
 #
 # 用法:
 #   zzucampusnetagent status              查询全部线路状态（JSON: {ts, lines:[...]}）
-#   zzucampusnetagent query  [线路]       查询单条线路（默认 main）
-#   zzucampusnetagent login  [线路]       登录单条线路（默认 main）
-#   zzucampusnetagent logout [线路]       注销单条线路（默认 main）
+#   zzucampusnetagent query  [线路]       查询单条线路（默认第一条）
+#   zzucampusnetagent login  [线路]       登录单条线路（默认第一条）
+#   zzucampusnetagent logout [线路]       注销单条线路（默认第一条）
 #   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
 #   zzucampusnetagent watchdog            检查全部线路，离线的自动重新登录
+#   zzucampusnetagent migrate             把旧版配置迁移为新版（见 migrate()）
 #
-# 线路: "main" 为主线路（UCI 的 config 段），其余为 UCI 中类型为 line 的段名。
+# 线路: UCI 中类型为 line 的段，段名即线路 id（旧版主线路迁移后为 "main"），
+# 每条线路自带 account/password。config 段只存全局设置：服务器地址、定时重授权、掉线检测。
 # 每条线路可绑定一个 netifd 逻辑接口（iface），请求会以该接口的 IP 为源地址发出，
-# 从而让同一账号在不同出口上分别以不同运营商认证。
+# 从而让同一账号在不同出口上分别以不同运营商认证；iface 留空则走系统默认路由。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
 CFG="zzucampusnetagent"
 TAG="zzucampusnetagent"
 LOCK="/var/lock/zzucampusnetagent.lock"
+MLOCK="/var/lock/zzucampusnetagent.migrate.lock"
 
 cfg() { uci -q get "${CFG}.config.$1" 2>/dev/null; }
 base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
@@ -25,22 +28,53 @@ base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
 # 线路 id 合法性（防注入）：只允许字母数字下划线
 valid_id() { case "$1" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
 
-# 读取线路属性：main → config 段，其它 → 同名 line 段
-lget() {
-	if [ "$1" = "main" ]; then cfg "$2"
-	else uci -q get "${CFG}.$1.$2" 2>/dev/null; fi
-}
+# 读取线路属性（同名 line 段）
+lget() { uci -q get "${CFG}.$1.$2" 2>/dev/null; }
 
 line_exists() {
-	[ "$1" = "main" ] && return 0
 	valid_id "$1" || return 1
 	[ "$(uci -q get "${CFG}.$1" 2>/dev/null)" = "line" ]
 }
 
-# 列出全部已启用线路（main 永远在第一个）
+# 旧版配置：config 段里还有主线路设置（name/iface/isp）或共用账号密码（account/password）
+has_legacy() { uci -q show "${CFG}.config" 2>/dev/null | grep -q "^${CFG}\.config\.\(name\|iface\|isp\|account\|password\)="; }
+
+# 旧版 → 新版：
+#   1. config 段的主线路设置搬到 line 段 'main'（排在最前）
+#   2. 共用账号/密码填进没有自己账号/密码的线路（已有的不覆盖）
+#   3. 删掉 config 段里的这些旧选项
+migrate() {
+	has_legacy || return 0
+	(
+		command -v flock >/dev/null 2>&1 && flock -x 8 2>/dev/null
+		has_legacy || exit 0
+		# 有主线路旧选项，或一条线路都没有（共用账号需要有处安放）→ 建 line 段 main
+		if { uci -q show "${CFG}.config" | grep -q "^${CFG}\.config\.\(name\|iface\|isp\)=" ||
+		     ! uci -q show "$CFG" | grep -q "=line\$"; } &&
+		   [ "$(uci -q get "${CFG}.main")" != "line" ]; then
+			uci -q delete "${CFG}.main"
+			uci set "${CFG}.main=line"
+			uci set "${CFG}.main.enabled=1"
+			for o in name iface isp; do
+				v=$(cfg "$o"); [ -n "$v" ] && uci set "${CFG}.main.$o=$v"
+			done
+			uci reorder "${CFG}.main=1"
+		fi
+		for o in account password; do
+			v=$(cfg "$o"); [ -n "$v" ] || continue
+			for id in $(uci -q show "$CFG" | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+				[ -n "$(lget "$id" "$o")" ] || uci set "${CFG}.${id}.${o}=$v"
+			done
+		done
+		for o in name iface isp account password; do uci -q delete "${CFG}.config.$o"; done
+		uci commit "$CFG"
+		logger -t "$TAG" "migrated legacy config (main line / shared account) into line sections"
+	) 8>"$MLOCK"
+}
+
+# 列出全部已启用线路（按 UCI 中的顺序）
 line_ids() {
 	local id
-	echo main
 	for id in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
 		[ "$(uci -q get "${CFG}.${id}.enabled" 2>/dev/null)" = "0" ] && continue
 		echo "$id"
@@ -224,16 +258,15 @@ cmd_status() {
 cmd_login() {
 	local id="$1" account password suffix acct pwb64 url raw json result msg
 	line_exists "$id" || { bad_line "$id"; return; }
-	# 线路可自带账号/密码；留空则回退到主账号（config 段）
-	account=$(lget "$id" account); [ -z "$account" ] && account=$(cfg account)
-	password=$(lget "$id" password); [ -z "$password" ] && password=$(cfg password)
+	account=$(lget "$id" account)
+	password=$(lget "$id" password)
 	suffix=$(isp_suffix "$(lget "$id" isp)")
 	json_init
 	json_add_int ts "$(date +%s)"
 	json_add_string id "$id"
 	if [ -z "$account" ] || [ -z "$password" ]; then
 		json_add_int result 0
-		json_add_string msg "请先在下方设置账号和密码并保存"
+		json_add_string msg "请先在下方「认证线路」中填写该线路的账号和密码并保存"
 		json_dump; return
 	fi
 	if ! resolve_bind "$id"; then
@@ -311,13 +344,22 @@ cmd_watchdog() {
 # 注：BusyBox flock 不支持 -w 超时；每次请求自带 8s 超时，持锁时间有上限
 lock_fd() { command -v flock >/dev/null 2>&1 && flock -x 9 2>/dev/null; return 0; }
 
-line="${2:-main}"
+# 旧版配置按需迁移（已是新版时只多一次 uci show）
+migrate
+
+# 未指定线路时取第一条（即使已禁用，保证手动操作有目标）
+line="$2"
+if [ -z "$line" ]; then
+	line=$(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p" | head -n 1)
+	line="${line:-main}"
+fi
 case "$1" in
+	migrate)  ;;
 	status)   cmd_status ;;
 	query)    cmd_query  "$line" ;;
 	login)    cmd_login  "$line" ;;
 	logout)   cmd_logout "$line" ;;
 	reauth)   cmd_reauth "$2" ;;
 	watchdog) cmd_watchdog ;;
-	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog}" >&2; exit 1 ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog|migrate}" >&2; exit 1 ;;
 esac

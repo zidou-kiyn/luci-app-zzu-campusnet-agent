@@ -8,8 +8,8 @@ case "$1" in
 		read -r input 2>/dev/null
 		[ -z "$input" ] && input='{}'
 		line=$(jsonfilter -s "$input" -e '@.line' 2>/dev/null)
-		# 线路 id 只允许字母数字下划线，其余一律按主线路处理
-		case "$line" in ""|*[!A-Za-z0-9_]*) line="main" ;; esac
+		# 线路 id 只允许字母数字下划线，其余一律置空（后端取第一条线路）
+		case "$line" in *[!A-Za-z0-9_]*) line="" ;; esac
 		case "$2" in
 			status) "$BIN" status ;;
 			query)  "$BIN" query  "$line" ;;

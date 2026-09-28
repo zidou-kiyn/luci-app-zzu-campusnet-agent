@@ -1,0 +1,4 @@
+#!/bin/sh
+# 升级安装时把旧版配置（主线路存于 config 段）迁移为 line 段
+[ -x /usr/sbin/zzucampusnetagent ] && /usr/sbin/zzucampusnetagent migrate >/dev/null 2>&1
+exit 0

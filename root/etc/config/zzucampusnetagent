@@ -1,18 +1,25 @@
 config zzucampusnetagent 'config'
 	option baseurl '172.16.4.14'
-	option account ''
-	option password ''
-	option name '主线路'
-	option iface ''
-	option isp 'campus'
 	option auto_relogin '0'
 	option relogin_time '06:00'
 	option watchdog '0'
 	option watchdog_interval '5'
 
-# 额外线路示例（同一账号在另一个出口以其它运营商认证）：
+# 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；
+# iface 留空 = 走系统默认路由（单线路时保持留空即可）；account/password 每条线路各自填写。
+config line 'main'
+	option enabled '1'
+	option name '主线路'
+	option account ''
+	option password ''
+	option iface ''
+	option isp 'campus'
+
+# 多线路示例（同一账号在另一个出口以其它运营商认证）：
 # config line
 #	option enabled '1'
 #	option name '移动1'
+#	option account '学号'
+#	option password '密码'
 #	option iface 'wancm1'
 #	option isp 'cmcc'

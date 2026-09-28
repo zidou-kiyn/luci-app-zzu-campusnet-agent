@@ -37,9 +37,12 @@ sync_cron() {
 	/etc/init.d/cron restart >/dev/null 2>&1
 }
 
-start_service()  { sync_cron; }
+# 旧版配置（主线路存于 config 段）迁移为 line 段
+migrate() { [ -x /usr/sbin/zzucampusnetagent ] && /usr/sbin/zzucampusnetagent migrate >/dev/null 2>&1; }
+
+start_service()  { migrate; sync_cron; }
 reload_service() { sync_cron; }
-boot()           { sync_cron; }
+boot()           { migrate; sync_cron; }
 
 stop_service() {
 	[ -f "$CRON" ] && sed -i -e "\|$TAG|d" -e "\|$TAG_WD|d" "$CRON"

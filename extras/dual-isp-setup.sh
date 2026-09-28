@@ -6,7 +6,7 @@
 #  - 新建独立网段 + 专用 WiFi，该网段固定走虚拟 WAN（断线不回落主线路）
 #  - 专用网段用独立 dnsmasq 实例，上游为经虚拟 WAN 出口的公共加密 DNS（DoH），
 #    CDN 按该运营商调度；未装 https-dns-proxy 时退化为经虚拟 WAN 的明文公共 DNS
-#  - 在插件里添加对应的“额外线路”，自动认证/保活
+#  - 在插件「认证线路」里添加对应线路（账号密码默认沿用 main 线路，可用 ACCT/PASS 覆盖），自动认证/保活
 #
 #  用法（在路由器上）：  sh dual-isp-setup.sh            安装/更新
 #                        sh dual-isp-setup.sh remove     移除
@@ -253,14 +253,19 @@ else
 	uci set "wireless.${L}_ap.encryption=none"
 fi
 
-# ---- 插件：额外线路 + 掉线自动重登 ----
+# ---- 插件：认证线路 + 掉线自动重登 ----
 if uci -q get zzucampusnetagent.config >/dev/null; then
+	command -v zzucampusnetagent >/dev/null && zzucampusnetagent migrate 2>/dev/null   # 旧版共用账号 → 各线路
+	ACCT="${ACCT:-$(uci -q get zzucampusnetagent.main.account)}"
+	PASS="${PASS:-$(uci -q get zzucampusnetagent.main.password)}"
 	uci -q delete "zzucampusnetagent.$S"
 	uci set "zzucampusnetagent.$S=line"
 	uci set "zzucampusnetagent.$S.enabled=1"
 	uci set "zzucampusnetagent.$S.name=$NAME"
 	uci set "zzucampusnetagent.$S.iface=$IFACE"
 	uci set "zzucampusnetagent.$S.isp=$ISP"
+	[ -n "$ACCT" ] && uci set "zzucampusnetagent.$S.account=$ACCT"
+	[ -n "$PASS" ] && uci set "zzucampusnetagent.$S.password=$PASS"
 	uci set zzucampusnetagent.config.watchdog=1
 fi
 

@@ -106,8 +106,14 @@ uci commit firewall
 
 # ── 认证插件：主线路绑定 wanct1，新增两条线路 ──
 echo ">>> 配置认证线路..."
-uci set zzucampusnetagent.config.iface='wanct1'
-[ "$(uci -q get zzucampusnetagent.config.name)" = "主线路" ] && uci set zzucampusnetagent.config.name='电信1'
+zzucampusnetagent migrate 2>/dev/null   # 旧版配置（主线路/共用账号在 config 段）先迁移到 line 段
+if [ "$(uci -q get zzucampusnetagent.main)" != "line" ]; then
+	uci set zzucampusnetagent.main=line
+	uci set zzucampusnetagent.main.enabled='1'
+	uci set zzucampusnetagent.main.isp='telecom'
+fi
+uci set zzucampusnetagent.main.iface='wanct1'
+case "$(uci -q get zzucampusnetagent.main.name)" in ""|"主线路") uci set zzucampusnetagent.main.name='电信1' ;; esac
 uci set zzucampusnetagent.wanct2=line
 uci set zzucampusnetagent.wanct2.enabled='1'
 uci set zzucampusnetagent.wanct2.name='电信2'
@@ -120,10 +126,16 @@ uci set zzucampusnetagent.wancm2.enabled='1'
 uci set zzucampusnetagent.wancm2.name='移动2'
 uci set zzucampusnetagent.wancm2.iface='wancm2'
 uci set zzucampusnetagent.wancm2.isp='cmcc'
-# wancm2 的 account/password 留空 → 继承主账号 A
-uci reorder zzucampusnetagent.wanct2=1
-uci -q get zzucampusnetagent.wancm1 >/dev/null && uci reorder zzucampusnetagent.wancm1=2
-uci reorder zzucampusnetagent.wancm2=3
+# wancm2 用 A 号：默认沿用 main 线路的账号密码（可用 ACCT_A / PASS_A 覆盖）
+ACCT_A="${ACCT_A:-$(uci -q get zzucampusnetagent.main.account)}"
+PASS_A="${PASS_A:-$(uci -q get zzucampusnetagent.main.password)}"
+[ -n "$ACCT_A" ] && uci set zzucampusnetagent.wancm2.account="$ACCT_A"
+[ -n "$PASS_A" ] && uci set zzucampusnetagent.wancm2.password="$PASS_A"
+# 顺序：config(0) main(1) wanct2(2) wancm1(3) wancm2(4)
+uci reorder zzucampusnetagent.main=1
+uci reorder zzucampusnetagent.wanct2=2
+uci -q get zzucampusnetagent.wancm1 >/dev/null && uci reorder zzucampusnetagent.wancm1=3
+uci reorder zzucampusnetagent.wancm2=4
 uci commit zzucampusnetagent
 
 # ── sysctl：同网段多出口防 ARP 串线；多路哈希按连接 ──

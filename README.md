@@ -7,7 +7,7 @@
 - ⏰ **每天定时重新授权**：到点若在线则先注销、隔 1 秒再登录，保证授权不掉线（默认凌晨 06:00）
 - 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信1 + 移动1），每条线路独立显示状态、独立登录/注销
 - 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
-- ⚙ **UI 内可改**：服务器地址 baseurl、账号、密码、运营商（移动/联通/电信/校园网/学科专网）、定时开关与时间
+- ⚙ **UI 内可改**：服务器地址 baseurl、定时开关与时间；「认证线路」表格里每行一条线路（名称、账号、密码、出口接口、运营商 移动/联通/电信/校园网/学科专网）
 - 🎨 Argon Design 配色卡片风，贴近 argon 主题
 
 ## 它有多轻量
@@ -67,7 +67,7 @@ ssh root@192.168.31.1 sh /root/dual-isp-setup.sh remove   # 移除
 | DNS | 移动网段用**独立 dnsmasq 实例**（`dhcp.lancm_dns`），上游为经移动出口的**公共加密 DNS**（阿里 / 腾讯 DoH），CDN 按移动调度。详见下方 |
 | DHCP | 由移动 dnsmasq 实例提供，客户端 DNS 即路由器（`192.168.32.1`） |
 | WiFi | 5G 射频上新增 `OpenWrt-CMCC-5G`，密码沿用该射频原 WiFi；支持时用 WPA2/WPA3 混合（`ENC` 可覆盖）；网桥使用独立 MAC（不能与 WiFi 接口/BSSID 相同） |
-| 插件 | 添加额外线路 `wancm1`「移动1」（@cmcc），开启掉线自动重登 |
+| 插件 | 添加认证线路 `wancm1`「移动1」（@cmcc），开启掉线自动重登 |
 
 > 说明：没有外部服务器时，**单个连接无法叠加两条线路带宽**；这里是按 WiFi 固定分流。
 
@@ -136,7 +136,7 @@ ssh root@192.168.31.1 sh /root/quad-wan-setup.sh remove                         
 | 每线一张路由表 | `wanct1`~`wancm2`(101~104)，netifd 自动加 `from <线路IP> lookup <线路表>`，保证路由器自身发出的包源 IP 与出口一致。校园网按 MAC 识别会话，不一致时认证请求会算到另一条线上（看门狗误判、登录串号） |
 | 组表 | 只放多路默认路由，由 `/etc/hotplug.d/iface/99-multipath`（即 `extras/99-multipath`）在线路上下线时重建；nexthop 用 `onlink`，全部断开时删除默认路由 |
 | 多路哈希 | `fib_multipath_hash_policy=1` 按连接分摊，单任务多线程下载可叠加；同组线路出口 IP 相同，换线不掉网站登录 |
-| 认证 | 主线路绑定 `wanct1`；新增线路「电信2」（B 号）、「移动2」（继承主账号） |
+| 认证 | 线路 `main` 绑定 `wanct1`（「电信1」）；新增线路「电信2」（B 号）、「移动2」（A 号，默认沿用 `main` 线路的账号密码） |
 
 > 注意：netifd 停止时不会删除 macvlan，残留设备会导致同名设备认领失败（`DEVICE_CLAIM_FAILED`）或新设备套不上原 MAC。
 > 脚本重启网络时先 `network stop`、删掉各线路设备再 `start`；手动改线路名时也应这样做。
@@ -164,7 +164,7 @@ uci commit network; /etc/init.d/network reload
 | `/usr/sbin/zzucampusnetagent` | 核心 CLI：`status/query/login/logout/reauth/watchdog`，编码与解析都在这里 |
 | `/usr/libexec/rpcd/luci.zzucampusnetagent` | rpcd 包装层，把上面三个动作暴露给 LuCI（ubus） |
 | `/etc/init.d/zzucampusnetagent` | 按配置同步 cron 定时任务（procd reload 触发） |
-| `/etc/config/zzucampusnetagent` | UCI 配置：`config` 段为共用账号 + 主线路；`line` 段为额外线路（iface/isp） |
+| `/etc/config/zzucampusnetagent` | UCI 配置：`config` 段为全局设置（服务器、定时任务）；每个 `line` 段是一条认证线路（name/account/password/iface/isp）。旧版把主线路和共用账号密码存在 `config` 段，升级后自动迁移：主线路 → `line` 段 `main`，共用账号密码 → 填进没有自己账号密码的线路 |
 | `extras/dual-isp-setup.sh` | （不随包安装）双运营商分流一键配置脚本 |
 | `extras/dual-isp-sqm.sh` | （不随包安装）主线路改 macvlan + 分线路 SQM |
 | `extras/quad-wan-setup.sh` / `99-multipath` | （不随包安装）四线聚合 + 组表多路默认路由 hotplug |
@@ -210,7 +210,7 @@ apk add --allow-untrusted /tmp/luci-app-zzu-campusnet-agent-*.apk
    ```
 
 3. 打开 LuCI → **服务 → ZZU CampusNet Agent**。
-   首次使用：展开页面下方 **账号与认证设置** 填 **账号 / 密码 / 运营商** →【保存并应用】→ 再点 **🔑 登录**。
+   首次使用：展开页面下方 **账号与认证设置** 在 **认证线路** 表格里填好 **账号 / 密码 / 运营商** →【保存并应用】→ 再点 **登录**。
    开启 **每天定时重新授权** 并设好时间后，同样点【保存并应用】即生效（自动写入 cron）。
 
 ---
@@ -256,7 +256,7 @@ sh /tmp/install.sh
 | `root/etc/init.d/zzucampusnetagent` | `/etc/init.d/zzucampusnetagent` |
 | `root/usr/share/luci/menu.d/luci-app-zzu-campusnet-agent.json` | `/usr/share/luci/menu.d/luci-app-zzu-campusnet-agent.json` |
 | `root/usr/share/rpcd/acl.d/luci-app-zzu-campusnet-agent.json` | `/usr/share/rpcd/acl.d/luci-app-zzu-campusnet-agent.json` |
-| `root/etc/config/zzucampusnetagent` | `/etc/config/zzucampusnetagent`（已存在则别覆盖，保留你的设置） |
+| `root/etc/config/zzucampusnetagent` | `/etc/config/zzucampusnetagent`（已存在则别覆盖，保留你的设置；旧版配置会在首次调用时自动迁移） |
 
 ## 安装方法三：用 SDK 编译成 ipk（可选）
 
@@ -274,11 +274,12 @@ make package/luci-app-zzu-campusnet-agent/compile V=s
 
 ```sh
 zzucampusnetagent status          # 全部线路状态 JSON
-zzucampusnetagent query [线路]    # 单条线路状态（默认 main；额外线路用段名，如 wancm1）
+zzucampusnetagent query [线路]    # 单条线路状态（线路用 UCI 段名，如 main / wancm1；省略 = 第一条）
 zzucampusnetagent login [线路]    # 用已保存配置登录
 zzucampusnetagent logout [线路]   # 注销
 zzucampusnetagent reauth [线路]   # “注销→隔1s→登录”；不带参数 = 全部线路
 zzucampusnetagent watchdog        # 检查全部线路，离线的自动重登
+zzucampusnetagent migrate         # 手动触发旧版配置迁移（平时每次调用都会自动检查）
 logread | grep zzucampusnetagent    # 看定时重授权日志
 crontab -l                  # 确认定时任务已写入（# zzucampusnetagent-reauth / -watchdog）
 ```
