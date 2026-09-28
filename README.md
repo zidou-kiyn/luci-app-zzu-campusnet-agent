@@ -5,6 +5,8 @@
 - 🟢 每 **10 秒** 自动查询并显示在线状态（账号 / 运营商 / 时长 / IP），带 **手动刷新** 按钮
 - 🔑 **一键登录 / 注销**（portal 认证）
 - ⏰ **每天定时重新授权**：到点若在线则先注销、隔 1 秒再登录，保证授权不掉线（默认凌晨 06:00）
+- 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信日常 + 移动下载），每条线路独立显示状态、独立登录/注销
+- 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
 - ⚙ **UI 内可改**：服务器地址 baseurl、账号、密码、运营商（移动/联通/电信/校园网/学科专网）、定时开关与时间
 - 🎨 Argon Design 配色卡片风，贴近 argon 主题
 
@@ -24,14 +26,90 @@
 
 账号密码只在路由器内部使用，**不经过浏览器**。
 
+多线路时，每条线路绑定一个 netifd 接口，请求用 `curl --interface <该接口IP>` 发出，
+认证服务器据此把不同 IP 分别认证为不同运营商。
+
+---
+
+## 双运营商分流（电信日常 + 移动下载）
+
+实测郑大校园网允许**同一账号在两个 IP 上同时在线且运营商不同**。一根网线即可实现：
+
+```
+                    ┌─ wan   (原 MAC, 10.172.a.b) ── 电信 ── OpenWrt-2.4G / OpenWrt-5G / 有线 LAN (192.168.31.0/24)
+校园网网线 ── wan ──┤
+                    └─ wancm (macvlan, 10.172.c.d) ── 移动 ── OpenWrt-CMCC-5G (192.168.32.0/24)
+```
+
+一键配置（在路由器上，需已装本插件；依赖 `kmod-macvlan`、`curl`）：
+
+```sh
+scp extras/dual-isp-setup.sh root@192.168.31.1:/root/
+ssh root@192.168.31.1 sh /root/dual-isp-setup.sh          # 安装
+ssh root@192.168.31.1 sh /root/dual-isp-setup.sh remove   # 移除
+# 可用环境变量改默认值：SSID / RADIO / SUBNET / ISP / NAME / KEY / DNS / MAC
+```
+
+脚本做了这些事：
+
+| 项 | 说明 |
+|----|------|
+| macvlan `wancm` | 在 `wan` 上建第二个 MAC，DHCP 拿第二个校园网 IP；MAC 固定，续租 IP 不变 |
+| 路由表 `cmcc`(100) | `wancm` 的路由只进这张表，主线路默认路由不受影响 |
+| 策略路由 | 从移动 WiFi 进来（`iif br-cmcc`）的 `192.168.32.0/24` 查 `cmcc` 表；表空（移动断线）时**直接不可达、不回落电信**。必须限定 iif，否则路由器发给客户端的 DNS 应答也会被送去 WAN |
+| `suppress_prefixlength` 规则 | 修正 netifd 自动加的 `to 10.172.0.0/16 lookup cmcc`，防止主线路 DHCP 续租等内网流量错走移动 |
+| `arp_ignore=1 / arp_announce=2` | 同网段双出口防 ARP 串线（否则认证服务器看到的 MAC 会错） |
+| 防火墙 | 新区域 `cmcc` → `wan`（`wancm` 加入 wan 区域做 NAT），与主 LAN 隔离 |
+| DHCP DNS | 给移动网段下发公共 DNS。普通 53 端口查询若被路由器劫持则由路由器应答；安卓"私人 DNS 自动"会对其走 DoT(853) 经移动出口，CDN 按移动调度 |
+| WiFi | 5G 射频上新增 `OpenWrt-CMCC-5G`，密码沿用该射频原 WiFi；网桥使用独立 MAC（不能与 WiFi 接口/BSSID 相同） |
+| 插件 | 添加额外线路 `wancm`（@cmcc），开启掉线自动重登 |
+
+> 说明：没有外部服务器时，**单个连接无法叠加两条线路带宽**；这里是按 WiFi 固定分流。
+
+### 分线路限速（SQM）
+
+macvlan 的流量会先经过父设备 `wan` 的 tc ingress，SQM 挂在 `wan` 或物理口上会把两条线路算在一起。
+`extras/dual-isp-sqm.sh` 把主线路也挪到 macvlan `wanct`（沿用原 WAN MAC，物理口换随机 MAC），
+然后给 `wanct`、`wancm` 各建一个 cake 队列，并开启全核 RPS（`packet_steering=2`）：
+
+```sh
+scp extras/dual-isp-sqm.sh root@192.168.31.1:/root/
+ssh root@192.168.31.1 "CT_DOWN=142000 CT_UP=50000 CM_DOWN=285000 CM_UP=50000 sh /root/dual-isp-sqm.sh"
+ssh root@192.168.31.1 sh /root/dual-isp-sqm.sh remove    # 还原
+```
+
+速率建议取实测的 90%~95%，之后也可直接在 LuCI → 网络 → SQM QoS 里改。
+主线路换设备后 DHCP 可能分到新 IP，脚本结尾会调用 `zzucampusnetagent watchdog` 立即补登。
+
+> 性能参考（2 核 A53 @1GHz）：单线路跑满无压力；两条线同时满载时 CPU 基本吃满，
+> 路由器本机测速总吞吐约 230M（不开 SQM 约 270M）。CPU 不够时可在 LuCI → 网络 → SQM QoS
+> 把两个队列取消启用，或 `uci set sqm.wanct.enabled=0; uci set sqm.wancm.enabled=0; uci commit sqm; /etc/init.d/sqm stop`。
+
+### 关闭 IPv6
+
+郑大校园网的 IPv6 **免认证且统一走中国移动出口**（前缀 `2409:87xx` 属于移动），
+实测多连接总速率被限在约 **120 Mbps**（两个不同 CDN 节点叠加仍是 ~123M，单连接约 25M）。
+不关的话连"电信" WiFi 的设备也会优先用移动 v6。关闭方法：
+
+```sh
+uci set dhcp.lan.ra='disabled'; uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.@dnsmasq[0].filter_aaaa='1'          # 不给客户端返回 AAAA
+uci commit dhcp; /etc/init.d/odhcpd stop; /etc/init.d/odhcpd disable; /etc/init.d/dnsmasq reload
+uci set network.wan6.disabled='1'; uci -q delete network.lan.ip6assign; uci -q delete network.globals.ula_prefix
+uci commit network; /etc/init.d/network reload
+```
+
+客户端已有的 v6 地址需重连 WiFi 后消失。
+
 ## 组件一览
 
 | 文件 | 作用 |
 |------|------|
-| `/usr/sbin/zzucampusnetagent` | 核心 CLI：`query/login/logout/reauth`，编码与解析都在这里 |
+| `/usr/sbin/zzucampusnetagent` | 核心 CLI：`status/query/login/logout/reauth/watchdog`，编码与解析都在这里 |
 | `/usr/libexec/rpcd/luci.zzucampusnetagent` | rpcd 包装层，把上面三个动作暴露给 LuCI（ubus） |
 | `/etc/init.d/zzucampusnetagent` | 按配置同步 cron 定时任务（procd reload 触发） |
-| `/etc/config/zzucampusnetagent` | UCI 配置：baseurl/account/password/isp/auto_relogin/relogin_time |
+| `/etc/config/zzucampusnetagent` | UCI 配置：`config` 段为共用账号 + 主线路；`line` 段为额外线路（iface/isp） |
+| `extras/dual-isp-setup.sh` | （不随包安装）双运营商分流一键配置脚本 |
 | `htdocs/.../view/zzucampusnetagent/status.js` | LuCI 前端：状态卡片 + 操作按钮 + 设置表单 |
 | `menu.d` / `acl.d` | 菜单（服务下）与权限 |
 
@@ -137,12 +215,14 @@ make package/luci-app-zzu-campusnet-agent/compile V=s
 ## 自检 / 排错（在路由器 SSH 里）
 
 ```sh
-zzucampusnetagent query     # 看状态 JSON
-zzucampusnetagent login     # 用已保存配置登录
-zzucampusnetagent logout    # 注销
-zzucampusnetagent reauth    # 手动跑一次“注销→隔1s→登录”重授权流程
+zzucampusnetagent status          # 全部线路状态 JSON
+zzucampusnetagent query [线路]    # 单条线路状态（默认 main；额外线路用段名，如 wancm）
+zzucampusnetagent login [线路]    # 用已保存配置登录
+zzucampusnetagent logout [线路]   # 注销
+zzucampusnetagent reauth [线路]   # “注销→隔1s→登录”；不带参数 = 全部线路
+zzucampusnetagent watchdog        # 检查全部线路，离线的自动重登
 logread | grep zzucampusnetagent    # 看定时重授权日志
-crontab -l                  # 确认定时任务已写入（含 # zzucampusnetagent-reauth）
+crontab -l                  # 确认定时任务已写入（# zzucampusnetagent-reauth / -watchdog）
 ```
 
 - `query` 能返回 `"status":"online"` 说明后端正常；页面看不到就 Ctrl+F5 强刷。
