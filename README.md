@@ -38,7 +38,7 @@
 ```
                     ┌─ wanct1 (原 MAC, 10.172.a.b) ── 电信 ── OpenWrt-2.4G / OpenWrt-5G / 有线 LAN   lan   (192.168.31.0/24)
 校园网网线 ── wan ──┤
-                    └─ wancm1 (macvlan, 10.172.c.d) ── 移动 ── OpenWrt-CMCC-5G                 lancm (192.168.32.0/24)
+                    └─ wancm1 (macvlan, 10.172.c.d) ── 移动 ── OpenWrt-CMCC-5G                    lancm (192.168.32.0/24)
 ```
 
 命名约定：线路 = `wan<运营商><序号>`（逻辑接口名与设备名相同），专用网段 = `lan<运营商>`，
