@@ -4,6 +4,8 @@
 #  - 主线路（原 WAN）保持不变，现有 WiFi/LAN 继续走它
 #  - 在 WAN 上建 macvlan 虚拟 WAN（第二个 MAC → 第二个校园网 IP）
 #  - 新建独立网段 + 专用 WiFi，该网段固定走虚拟 WAN（断线不回落主线路）
+#  - 专用网段用独立 dnsmasq 实例，上游为经虚拟 WAN 出口的公共加密 DNS（DoH），
+#    CDN 按该运营商调度；未装 https-dns-proxy 时退化为经虚拟 WAN 的明文公共 DNS
 #  - 在插件里添加对应的“额外线路”，自动认证/保活
 #
 #  用法（在路由器上）：  sh dual-isp-setup.sh            安装/更新
@@ -25,22 +27,42 @@ SSID="${SSID:-OpenWrt-CMCC-5G}"
 KEY="${KEY:-}"                          # 留空 = 沿用该射频上默认 WiFi 的密码
 ISP="${ISP:-cmcc}"
 NAME="${NAME:-移动下载}"
-DNS="${DNS:-223.5.5.5,119.29.29.29}"    # 下发给专用网段客户端的 DNS（经虚拟 WAN 出去，CDN 按该运营商调度）
 MAC="${MAC:-}"                          # 留空 = 首次随机生成并固定
+ENC="${ENC:-}"                          # 留空 = 支持 WPA3 则 sae-mixed，否则 psk2
+# 专用网段 DNS：两个 DoH 进程以专用用户运行，该用户的流量按 uidrange 规则走虚拟 WAN
+DOH1_URL="${DOH1_URL:-https://dns.alidns.com/dns-query}"; DOH1_BOOT="${DOH1_BOOT:-223.5.5.5,223.6.6.6}"
+DOH2_URL="${DOH2_URL:-https://doh.pub/dns-query}";         DOH2_BOOT="${DOH2_BOOT:-119.29.29.29,119.28.28.28}"
+DOH_PORT1="${DOH_PORT1:-5055}"; DOH_PORT2="${DOH_PORT2:-5056}"
+DNS_UID="${DNS_UID:-6053}"
+PLAIN_DNS="${PLAIN_DNS:-223.5.5.5 119.29.29.29}"   # 未装 https-dns-proxy 时的明文上游
 
 S="$(echo "$IFACE" | tr -c 'A-Za-z0-9_\n' '_')"   # UCI 段名前缀
+DNSI="$ZONE"                                        # 专用 dnsmasq 实例名
+DNSU="dns$ZONE"                                     # DoH 进程运行用户
+
+# 除专用实例外的 dnsmasq 段（主实例）
+other_dnsmasq() {
+	uci show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dnsmasq$/\1/p" | grep -vx "$DNSI"
+}
 
 if [ "$1" = "remove" ]; then
 	for c in "network.${S}_dev" "network.$IFACE" "network.${S}_br" "network.$LAN" \
 	         "network.${S}_rule" "network.${S}_strict" "network.${S}_main" \
-	         "dhcp.$LAN" "firewall.${S}_zone" "firewall.${S}_fwd" "wireless.${S}_ap" \
+	         "network.${S}_dnsuid" "network.${S}_dnsuid_strict" \
+	         "dhcp.$LAN" "dhcp.$DNSI" "https-dns-proxy.${ZONE}_ali" "https-dns-proxy.${ZONE}_tx" \
+	         "firewall.${S}_zone" "firewall.${S}_fwd" "wireless.${S}_ap" \
 	         "zzucampusnetagent.$S"; do
 		uci -q delete "$c"
 	done
+	for d in $(other_dnsmasq); do uci -q del_list "dhcp.$d.notinterface=$LAN"; done
+	[ "$(uci -q get https-dns-proxy.config.dnsmasq_config_update)" = "-" ] && \
+		uci set https-dns-proxy.config.dnsmasq_config_update='*'
 	Z=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
 	[ -n "$Z" ] && uci -q del_list "firewall.$Z.network=$IFACE"
 	uci commit; rm -f /etc/sysctl.d/99-zzu-multiwan.conf
-	/etc/init.d/network reload; /etc/init.d/firewall reload; /etc/init.d/dnsmasq reload
+	/etc/init.d/network reload; /etc/init.d/firewall reload
+	[ -x /etc/init.d/https-dns-proxy ] && /etc/init.d/https-dns-proxy restart
+	/etc/init.d/dnsmasq restart
 	/etc/init.d/zzucampusnetagent reload 2>/dev/null; wifi reload
 	echo "==> 已移除"; exit 0
 fi
@@ -54,6 +76,12 @@ fi
 grep -q "^$TABLE_ID[[:space:]]" /etc/iproute2/rt_tables || echo "$TABLE_ID	$TABLE" >> /etc/iproute2/rt_tables
 
 # ---- network ----
+# 重建时保留已有的 ipv6 开关（关闭 IPv6 时会设 ipv6=0）；未设置过则沿用父设备的
+V6=$(uci -q get "network.${S}_dev.ipv6")
+if [ -z "$V6" ]; then
+	PSEC=$(uci show network | sed -n "s/^network\.\([^.]*\)\.name='$PARENT'$/\1/p" | head -1)
+	[ -n "$PSEC" ] && V6=$(uci -q get "network.$PSEC.ipv6")
+fi
 uci -q delete "network.${S}_dev"
 uci set "network.${S}_dev=device"
 uci set "network.${S}_dev.name=$IFACE"
@@ -61,6 +89,7 @@ uci set "network.${S}_dev.type=macvlan"
 uci set "network.${S}_dev.ifname=$PARENT"
 uci set "network.${S}_dev.mode=bridge"
 uci set "network.${S}_dev.macaddr=$MAC"
+[ -n "$V6" ] && uci set "network.${S}_dev.ipv6=$V6"
 
 uci -q delete "network.$IFACE"
 uci set "network.$IFACE=interface"
@@ -118,14 +147,70 @@ net.ipv4.conf.all.arp_announce=2
 C
 sysctl -q -p /etc/sysctl.d/99-zzu-multiwan.conf
 
-# ---- dhcp ----
+# ---- DNS：专用网段独立 dnsmasq 实例，经虚拟 WAN 的加密 DNS 解析 ----
+# 有 https-dns-proxy → 新增两个 DoH 进程，以专用用户 $DNSU 运行；该用户流量按 uidrange
+#   规则查虚拟 WAN 的路由表（不依赖 IP，虚拟 WAN 换 IP 也无需改配置），表空时不可达不泄漏到主线路
+# 无 https-dns-proxy → 退化为绑定虚拟 WAN 的明文公共 DNS
+if [ -x /etc/init.d/https-dns-proxy ]; then
+	. /lib/functions.sh
+	group_exists "$DNSU" || group_add "$DNSU" "$DNS_UID"
+	user_exists "$DNSU"  || user_add "$DNSU" "$DNS_UID" "$DNS_UID" "$DNSU" "/var/run/$DNSU" /bin/false
+	uci -q delete "network.${S}_dnsuid"
+	uci set "network.${S}_dnsuid=rule"
+	uci set "network.${S}_dnsuid.uidrange=$DNS_UID"
+	uci set "network.${S}_dnsuid.lookup=$TABLE"
+	uci set "network.${S}_dnsuid.priority=1002"
+	uci -q delete "network.${S}_dnsuid_strict"
+	uci set "network.${S}_dnsuid_strict=rule"
+	uci set "network.${S}_dnsuid_strict.uidrange=$DNS_UID"
+	uci set "network.${S}_dnsuid_strict.action=unreachable"
+	uci set "network.${S}_dnsuid_strict.priority=1003"
+
+	# https-dns-proxy 默认会把所有 DoH 进程写进所有 dnsmasq 实例（主实例也会用上走虚拟 WAN 的 DoH），
+	# 改为不自动改写；主实例此前由它写入的 server=127.0.0.1#5053... 已持久化在 UCI 中，保持不变
+	uci set https-dns-proxy.config.dnsmasq_config_update='-'
+	for x in "${ZONE}_ali $DOH1_URL $DOH1_BOOT $DOH_PORT1" "${ZONE}_tx $DOH2_URL $DOH2_BOOT $DOH_PORT2"; do
+		set -- $x
+		uci -q delete "https-dns-proxy.$1"
+		uci set "https-dns-proxy.$1=https-dns-proxy"
+		uci set "https-dns-proxy.$1.resolver_url=$2"
+		uci set "https-dns-proxy.$1.bootstrap_dns=$3"
+		uci set "https-dns-proxy.$1.listen_addr=127.0.0.1"
+		uci set "https-dns-proxy.$1.listen_port=$4"
+		uci set "https-dns-proxy.$1.user=$DNSU"
+		uci set "https-dns-proxy.$1.group=$DNSU"
+	done
+	UPSTREAMS="127.0.0.1#$DOH_PORT1 127.0.0.1#$DOH_PORT2"
+else
+	UPSTREAMS=""; for d in $PLAIN_DNS; do UPSTREAMS="$UPSTREAMS $d@$IFACE"; done
+fi
+
+# 主实例不再服务专用网段
+for d in $(other_dnsmasq); do
+	uci -q del_list "dhcp.$d.notinterface=$LAN"; uci add_list "dhcp.$d.notinterface=$LAN"
+done
+uci -q delete "dhcp.$DNSI"
+uci set "dhcp.$DNSI=dnsmasq"
+for kv in domainneeded=1 boguspriv=1 localise_queries=1 rebind_protection=1 rebind_localhost=1 \
+          local=/$ZONE/ domain=$ZONE expandhosts=1 authoritative=1 readethers=0 \
+          leasefile=/tmp/dhcp.leases.$ZONE noresolv=1 localuse=0 localservice=1 \
+          cachesize=10000 dnsforwardmax=1000 filter_aaaa=1 ednspacket_max=1232; do
+	uci set "dhcp.$DNSI.${kv%%=*}=${kv#*=}"
+done
+uci add_list "dhcp.$DNSI.interface=$LAN"
+uci add_list "dhcp.$DNSI.notinterface=loopback"   # 127.0.0.1:53 归主实例
+for u in $UPSTREAMS; do uci add_list "dhcp.$DNSI.server=$u"; done
+# 并发问所有上游取最快；缓存过期后先返回旧结果再后台刷新（最多超期 1 小时）
+uci set "dhcp.$DNSI.extraconftext=all-servers\nuse-stale-cache=3600"
+
+# ---- dhcp（由专用实例提供，客户端 DNS 即路由器自己）----
 uci -q delete "dhcp.$LAN"
 uci set "dhcp.$LAN=dhcp"
 uci set "dhcp.$LAN.interface=$LAN"
+uci set "dhcp.$LAN.instance=$DNSI"
 uci set "dhcp.$LAN.start=100"
 uci set "dhcp.$LAN.limit=150"
 uci set "dhcp.$LAN.leasetime=12h"
-[ -n "$DNS" ] && uci add_list "dhcp.$LAN.dhcp_option=6,$DNS"
 
 # ---- firewall ----
 Z=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
@@ -153,8 +238,11 @@ uci set "wireless.${S}_ap.device=$RADIO"
 uci set "wireless.${S}_ap.network=$LAN"
 uci set "wireless.${S}_ap.mode=ap"
 uci set "wireless.${S}_ap.ssid=$SSID"
+if [ -z "$ENC" ]; then
+	hostapd -vsae >/dev/null 2>&1 && ENC=sae-mixed || ENC=psk2
+fi
 if [ -n "$KEY" ]; then
-	uci set "wireless.${S}_ap.encryption=psk2"
+	uci set "wireless.${S}_ap.encryption=$ENC"
 	uci set "wireless.${S}_ap.key=$KEY"
 else
 	uci set "wireless.${S}_ap.encryption=none"
@@ -174,7 +262,10 @@ fi
 uci commit
 /etc/init.d/network reload
 /etc/init.d/firewall reload
-/etc/init.d/dnsmasq reload
+# DoH 进程需在 uidrange 规则就绪后启动；新增 dnsmasq 实例需 restart 而非 reload
+i=0; until ip rule | grep -q "iif $BRIDGE lookup $TABLE" || [ $i -ge 15 ]; do sleep 1; i=$((i+1)); done
+[ -x /etc/init.d/https-dns-proxy ] && /etc/init.d/https-dns-proxy restart
+/etc/init.d/dnsmasq restart
 /etc/init.d/zzucampusnetagent reload 2>/dev/null
 
 . /lib/functions/network.sh

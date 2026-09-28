@@ -47,7 +47,7 @@
 scp extras/dual-isp-setup.sh root@192.168.31.1:/root/
 ssh root@192.168.31.1 sh /root/dual-isp-setup.sh          # 安装
 ssh root@192.168.31.1 sh /root/dual-isp-setup.sh remove   # 移除
-# 可用环境变量改默认值：SSID / RADIO / SUBNET / ISP / NAME / KEY / DNS / MAC
+# 可用环境变量改默认值：SSID / RADIO / SUBNET / ISP / NAME / KEY / ENC / MAC / DOH1_URL / DOH2_URL ...
 ```
 
 脚本做了这些事：
@@ -60,11 +60,35 @@ ssh root@192.168.31.1 sh /root/dual-isp-setup.sh remove   # 移除
 | `suppress_prefixlength` 规则 | 修正 netifd 自动加的 `to 10.172.0.0/16 lookup cmcc`，防止主线路 DHCP 续租等内网流量错走移动 |
 | `arp_ignore=1 / arp_announce=2` | 同网段双出口防 ARP 串线（否则认证服务器看到的 MAC 会错） |
 | 防火墙 | 新区域 `cmcc` → `wan`（`wancm` 加入 wan 区域做 NAT），与主 LAN 隔离 |
-| DHCP DNS | 给移动网段下发公共 DNS。普通 53 端口查询若被路由器劫持则由路由器应答；安卓"私人 DNS 自动"会对其走 DoT(853) 经移动出口，CDN 按移动调度 |
-| WiFi | 5G 射频上新增 `OpenWrt-CMCC-5G`，密码沿用该射频原 WiFi；网桥使用独立 MAC（不能与 WiFi 接口/BSSID 相同） |
+| DNS | 移动网段用**独立 dnsmasq 实例**（`dhcp.cmcc`），上游为经移动出口的**公共加密 DNS**（阿里 / 腾讯 DoH），CDN 按移动调度。详见下方 |
+| DHCP | 由移动 dnsmasq 实例提供，客户端 DNS 即路由器（`192.168.32.1`） |
+| WiFi | 5G 射频上新增 `OpenWrt-CMCC-5G`，密码沿用该射频原 WiFi；支持时用 WPA2/WPA3 混合（`ENC` 可覆盖）；网桥使用独立 MAC（不能与 WiFi 接口/BSSID 相同） |
 | 插件 | 添加额外线路 `wancm`（@cmcc），开启掉线自动重登 |
 
 > 说明：没有外部服务器时，**单个连接无法叠加两条线路带宽**；这里是按 WiFi 固定分流。
+
+### 两个网段各自的加密 DNS
+
+```
+电信局域网 → dnsmasq 主实例 → https-dns-proxy :5053/:5054（用户 nobody）  → 电信出口 → 阿里/腾讯 DoH
+移动 WiFi  → dnsmasq cmcc 实例 → https-dns-proxy :5055/:5056（用户 dnscmcc）→ 移动出口 → 阿里/腾讯 DoH
+```
+
+- 移动的两个 DoH 进程以专用用户 `dnscmcc`（uid 6053）运行，策略规则 `uidrange 6053 lookup cmcc`
+  让它们的流量走移动出口；按用户而非 IP 匹配，`wancm` 换 IP 也无需改配置。移动断线时该用户流量不可达，不会漏到电信
+- DoH 服务端看到的是移动出口 IP，因此返回移动的 CDN 节点（实测 `dldir1.qq.com`：电信实例 → `123.54.x`，移动实例 → `111.42.x`）
+- https-dns-proxy 默认会把**所有** DoH 进程写进**所有** dnsmasq 实例，脚本将其 `dnsmasq_config_update` 设为 `-`（不自动改写），
+  两个实例的上游各自固定
+- 两个实例都开启 `all-servers`（并发问两家取最快）与 `use-stale-cache`（缓存过期先返回再后台刷新）
+- 未安装 https-dns-proxy 时，移动实例退化为绑定 `wancm` 的明文公共 DNS（`223.5.5.5@wancm`）
+
+可选：给主实例也加上缓存 / 并发优化（日志出现 `Maximum number of concurrent DNS queries reached` 时建议）：
+
+```sh
+uci set dhcp.@dnsmasq[0].cachesize='10000'; uci set dhcp.@dnsmasq[0].dnsforwardmax='1000'
+uci set dhcp.@dnsmasq[0].extraconftext='all-servers\nuse-stale-cache=3600'
+uci commit dhcp; /etc/init.d/dnsmasq restart
+```
 
 ### 分线路限速（SQM）
 
