@@ -1,11 +1,57 @@
 #!/bin/sh
-# zzucampusnetagent - 郑大校园网 eportal 命令行核心
-# 用法: zzucampusnetagent {query|login|logout|reauth}
+# zzucampusnetagent - 郑大校园网 eportal 命令行核心（支持多线路）
+#
+# 用法:
+#   zzucampusnetagent status              查询全部线路状态（JSON: {ts, lines:[...]}）
+#   zzucampusnetagent query  [线路]       查询单条线路（默认 main）
+#   zzucampusnetagent login  [线路]       登录单条线路（默认 main）
+#   zzucampusnetagent logout [线路]       注销单条线路（默认 main）
+#   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
+#   zzucampusnetagent watchdog            检查全部线路，离线的自动重新登录
+#
+# 线路: "main" 为主线路（UCI 的 config 段），其余为 UCI 中类型为 line 的段名。
+# 每条线路可绑定一个 netifd 逻辑接口（iface），请求会以该接口的 IP 为源地址发出，
+# 从而让同一账号在不同出口上分别以不同运营商认证。
 . /usr/share/libubox/jshn.sh
+. /lib/functions/network.sh
 
 CFG="zzucampusnetagent"
+TAG="zzucampusnetagent"
+LOCK="/var/lock/zzucampusnetagent.lock"
+
 cfg() { uci -q get "${CFG}.config.$1" 2>/dev/null; }
 base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
+
+# 线路 id 合法性（防注入）：只允许字母数字下划线
+valid_id() { case "$1" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
+
+# 读取线路属性：main → config 段，其它 → 同名 line 段
+lget() {
+	if [ "$1" = "main" ]; then cfg "$2"
+	else uci -q get "${CFG}.$1.$2" 2>/dev/null; fi
+}
+
+line_exists() {
+	[ "$1" = "main" ] && return 0
+	valid_id "$1" || return 1
+	[ "$(uci -q get "${CFG}.$1" 2>/dev/null)" = "line" ]
+}
+
+# 列出全部已启用线路（main 永远在第一个）
+line_ids() {
+	local id
+	echo main
+	for id in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+		[ "$(uci -q get "${CFG}.${id}.enabled" 2>/dev/null)" = "0" ] && continue
+		echo "$id"
+	done
+}
+
+line_name() {
+	local n; n=$(lget "$1" name)
+	[ -n "$n" ] && { echo "$n"; return; }
+	[ "$1" = "main" ] && echo "主线路" || echo "$1"
+}
 
 isp_suffix() {
 	case "$1" in
@@ -57,12 +103,34 @@ b64() {
 	fi
 }
 
+# 解析线路的出口源 IP，结果放在全局 BIND；ERR 为失败原因
+# 未绑定接口 → BIND 为空（走系统默认路由，兼容单线路旧用法）
+resolve_bind() {
+	local iface
+	BIND=""; ERR=""
+	iface=$(lget "$1" iface)
+	[ -z "$iface" ] && return 0
+	if ! command -v curl >/dev/null 2>&1; then
+		ERR="多线路绑定接口需要 curl（opkg/apk 安装 curl）"; return 1
+	fi
+	network_flush_cache
+	network_get_ipaddr BIND "$iface"
+	[ -n "$BIND" ] && return 0
+	ERR="接口 ${iface} 未获取到 IPv4 地址（检查该接口是否已连接）"
+	return 1
+}
+
+# fetch URL [源IP]
 fetch() {
 	local ref ua
 	ref="http://$(base)/"
 	ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 	if command -v curl >/dev/null 2>&1; then
-		curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
+		if [ -n "$2" ]; then
+			curl -s --max-time 8 --interface "$2" -A "$ua" -e "$ref" "$1" 2>/dev/null
+		else
+			curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
+		fi
 	elif command -v uclient-fetch >/dev/null 2>&1; then
 		uclient-fetch -q -T 8 -U "$ua" -O - "$1" 2>/dev/null
 	else
@@ -72,15 +140,24 @@ fetch() {
 
 strip_jsonp() { echo "$1" | sed -e 's/^[^(]*(//' -e 's/)[^)]*$//'; }
 
-cmd_query() {
-	local raw json result msg
-	raw=$(fetch "http://$(base):801/eportal/portal/custom")
-	json_init
-	json_add_int ts "$(date +%s)"
+# 向当前 json 对象写入线路查询结果字段
+add_query_fields() {
+	local id="$1" raw json result msg
+	json_add_string id    "$id"
+	json_add_string name  "$(line_name "$id")"
+	json_add_string iface "$(lget "$id" iface)"
+	json_add_string isp   "$(lget "$id" isp)"
+	if ! resolve_bind "$id"; then
+		json_add_string status "error"
+		json_add_string msg "$ERR"
+		return
+	fi
+	json_add_string bind "$BIND"
+	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
 	if [ -z "$raw" ]; then
 		json_add_string status "error"
 		json_add_string msg "无法连接认证服务器（确认路由器已接入校园网）"
-		json_dump; return
+		return
 	fi
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
@@ -99,12 +176,13 @@ cmd_query() {
 		json_add_string status "error"
 		json_add_string msg "${msg:-接口返回异常}"
 	fi
-	json_dump
 }
 
+# 纯文本状态：online / offline / error
 query_state() {
 	local raw json
-	raw=$(fetch "http://$(base):801/eportal/portal/custom")
+	resolve_bind "$1" || { echo "error"; return; }
+	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
 	[ -z "$raw" ] && { echo "error"; return; }
 	json=$(strip_jsonp "$raw")
 	case "$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)" in
@@ -112,21 +190,59 @@ query_state() {
 	esac
 }
 
-cmd_login() {
-	local account password isp suffix acct pwb64 url raw json result msg
-	account=$(cfg account); password=$(cfg password); isp=$(cfg isp)
-	suffix=$(isp_suffix "$isp")
+bad_line() {
 	json_init
 	json_add_int ts "$(date +%s)"
+	json_add_int result 0
+	json_add_string status "error"
+	json_add_string msg "线路不存在：$1"
+	json_dump
+}
+
+cmd_query() {
+	line_exists "$1" || { bad_line "$1"; return; }
+	json_init
+	json_add_int ts "$(date +%s)"
+	add_query_fields "$1"
+	json_dump
+}
+
+cmd_status() {
+	local id
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_array lines
+	for id in $(line_ids); do
+		json_add_object ""
+		add_query_fields "$id"
+		json_close_object
+	done
+	json_close_array
+	json_dump
+}
+
+cmd_login() {
+	local id="$1" account password suffix acct pwb64 url raw json result msg
+	line_exists "$id" || { bad_line "$id"; return; }
+	account=$(cfg account); password=$(cfg password)
+	suffix=$(isp_suffix "$(lget "$id" isp)")
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_string id "$id"
 	if [ -z "$account" ] || [ -z "$password" ]; then
 		json_add_int result 0
 		json_add_string msg "请先在下方设置账号和密码并保存"
 		json_dump; return
 	fi
+	if ! resolve_bind "$id"; then
+		json_add_int result 0
+		json_add_string msg "$ERR"
+		json_dump; return
+	fi
 	acct=$(urlencode ",0,${account}${suffix}")
 	pwb64=$(urlencode "$(b64 "$password")")
 	url="http://$(base):801/eportal/portal/login?user_account=${acct}&user_password=${pwb64}"
-	raw=$(fetch "$url")
+	raw=$(fetch "$url" "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
@@ -136,35 +252,70 @@ cmd_login() {
 }
 
 cmd_logout() {
-	local raw json result msg
-	raw=$(fetch "http://$(base):801/eportal/portal/logout")
+	local id="$1" raw json result msg
+	line_exists "$id" || { bad_line "$id"; return; }
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_string id "$id"
+	if ! resolve_bind "$id"; then
+		json_add_int result 0
+		json_add_string msg "$ERR"
+		json_dump; return
+	fi
+	raw=$(fetch "http://$(base):801/eportal/portal/logout" "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
-	json_init
-	json_add_int ts "$(date +%s)"
 	json_add_int result "${result:-0}"
 	json_add_string msg "${msg:-注销请求失败}"
 	json_dump
 }
 
-cmd_reauth() {
-	local st
-	logger -t zzucampusnetagent "scheduled re-auth start"
-	st=$(query_state)
+reauth_one() {
+	local id="$1" st
+	st=$(query_state "$id")
 	if [ "$st" = "online" ]; then
-		cmd_logout >/dev/null 2>&1
-		logger -t zzucampusnetagent "logout done, sleep 1s then login"
+		cmd_logout "$id" >/dev/null 2>&1
 		sleep 1
 	fi
-	cmd_login >/dev/null 2>&1
-	logger -t zzucampusnetagent "scheduled re-auth finished (was: $st)"
+	cmd_login "$id" >/dev/null 2>&1
+	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(query_state "$id"))"
 }
 
+cmd_reauth() {
+	local id
+	exec 9>"$LOCK"; lock_fd
+	if [ -n "$1" ]; then
+		line_exists "$1" && reauth_one "$1"
+	else
+		logger -t "$TAG" "scheduled re-auth start"
+		for id in $(line_ids); do reauth_one "$id"; done
+	fi
+}
+
+# 离线（认证服务器可达但未登录）→ 自动登录；服务器不可达则不动作
+cmd_watchdog() {
+	local id st
+	exec 9>"$LOCK"; lock_fd
+	for id in $(line_ids); do
+		st=$(query_state "$id")
+		[ "$st" = "offline" ] || continue
+		cmd_login "$id" >/dev/null 2>&1
+		logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(query_state "$id")"
+	done
+}
+
+# 文件锁：避免定时重授权与掉线检测同时执行（flock 不可用则跳过加锁）
+# 注：BusyBox flock 不支持 -w 超时；每次请求自带 8s 超时，持锁时间有上限
+lock_fd() { command -v flock >/dev/null 2>&1 && flock -x 9 2>/dev/null; return 0; }
+
+line="${2:-main}"
 case "$1" in
-	query)  cmd_query ;;
-	login)  cmd_login ;;
-	logout) cmd_logout ;;
-	reauth) cmd_reauth ;;
-	*) echo "usage: $0 {query|login|logout|reauth}" >&2; exit 1 ;;
+	status)   cmd_status ;;
+	query)    cmd_query  "$line" ;;
+	login)    cmd_login  "$line" ;;
+	logout)   cmd_logout "$line" ;;
+	reauth)   cmd_reauth "$2" ;;
+	watchdog) cmd_watchdog ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog}" >&2; exit 1 ;;
 esac

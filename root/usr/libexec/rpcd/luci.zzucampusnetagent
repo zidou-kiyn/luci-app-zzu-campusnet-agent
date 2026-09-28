@@ -2,14 +2,19 @@
 BIN="/usr/sbin/zzucampusnetagent"
 case "$1" in
 	list)
-		echo '{ "query": { }, "login": { }, "logout": { } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" } }'
 		;;
 	call)
-		read -r _ 2>/dev/null
+		read -r input 2>/dev/null
+		[ -z "$input" ] && input='{}'
+		line=$(jsonfilter -s "$input" -e '@.line' 2>/dev/null)
+		# 线路 id 只允许字母数字下划线，其余一律按主线路处理
+		case "$line" in ""|*[!A-Za-z0-9_]*) line="main" ;; esac
 		case "$2" in
-			query)  "$BIN" query ;;
-			login)  "$BIN" login ;;
-			logout) "$BIN" logout ;;
+			status) "$BIN" status ;;
+			query)  "$BIN" query  "$line" ;;
+			login)  "$BIN" login  "$line" ;;
+			logout) "$BIN" logout "$line" ;;
 			*) echo '{}' ;;
 		esac
 		;;

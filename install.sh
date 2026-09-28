@@ -29,7 +29,7 @@ if [ "$1" = "uninstall" ]; then
 	[ -x "$INITD" ] && { "$INITD" stop 2>/dev/null || true; "$INITD" disable 2>/dev/null || true; }
 	rm -rf "$JS_DIR" "$OLD_JS_DIR"
 	rm -f "$RPCD" "$BIN" "$INITD" "$MENU" "$ACL" "$CFG" "$OLD_MENU" "$OLD_ACL" "$OLD_RPCD" "$OLD_BIN" "$OLD_INITD" "$OLD_CFG"
-	[ -f /etc/crontabs/root ] && sed -i -e '\|zzucampusnetagent-reauth|d' -e '\|zzustatus-reauth|d' /etc/crontabs/root 2>/dev/null || true
+	[ -f /etc/crontabs/root ] && sed -i -e '\|zzucampusnetagent-reauth|d' -e '\|zzucampusnetagent-watchdog|d' -e '\|zzustatus-reauth|d' /etc/crontabs/root 2>/dev/null || true
 	/etc/init.d/cron restart 2>/dev/null || true
 	rm -f /tmp/luci-indexcache* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
@@ -61,13 +61,17 @@ cat > "$JS_DIR/status.js" <<'ZZU_EOF_JS'
 'require poll';
 'require dom';
 'require ui';
+'require tools.widgets as widgets';
 
-var callQuery  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'query',  expect: { } });
-var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  expect: { } });
-var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', expect: { } });
+var callStatus = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'status', expect: { } });
+var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  params: [ 'line' ], expect: { } });
+var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', params: [ 'line' ], expect: { } });
 
 var STYLE = `
 .zzu-page{max-width:980px;margin:0 auto 24px}
+.zzu-line{margin-bottom:22px}
+.zzu-line:last-child{margin-bottom:0}
+.zzu-set-bd .cbi-section-table{margin-top:6px}
 .zzu-alert{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:12px;margin-bottom:16px;font-size:14px;font-weight:500;box-shadow:0 6px 18px rgba(50,50,93,.1);animation:zzuIn .22s ease}
 .zzu-alert.ok{background:#e7f6ef;color:#13855f;border:1px solid #c4ecda}
 .zzu-alert.err{background:#fdeaef;color:#c93a5d;border:1px solid #f7cad5}
@@ -143,27 +147,45 @@ var STATS = [
     { key: 'ip',       label: 'IP 地址',  icon: '🌐', bg: '#f0edfb' }
 ];
 
+var ISPS = [
+    [ 'campus',  '校园网 (无后缀)' ],
+    [ 'cmcc',    '中国移动 (@cmcc)' ],
+    [ 'unicom',  '中国联通 (@unicom)' ],
+    [ 'telecom', '中国电信 (@telecom)' ],
+    [ 'zzuplan', '学科专网 (@zzuplan)' ]
+];
+
 function fmt(v) { return (v === undefined || v === null || v === '') ? '—' : v; }
+
+function addIsp(o) {
+    ISPS.forEach(function(i) { o.value(i[0], i[1]); });
+    o.default = 'campus';
+}
 
 return view.extend({
     handleRefresh: function() { return this.refresh(); },
 
-    handleLogin: function() {
+    handleLogin: function(line) {
         var self = this;
-        return callLogin().then(function(r) {
+        return callLogin(line).then(function(r) {
             r = r || {};
-            self.showMsg(r.result == 1, (r.result == 1 ? '登录成功：' : '登录未成功：') + fmt(r.msg));
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '登录成功：' : '登录未成功：') + fmt(r.msg));
             return self.refresh();
         }).catch(function() { self.showMsg(false, '登录请求异常'); });
     },
 
-    handleLogout: function() {
+    handleLogout: function(line) {
         var self = this;
-        return callLogout().then(function(r) {
+        return callLogout(line).then(function(r) {
             r = r || {};
-            self.showMsg(r.result == 1, (r.result == 1 ? '注销成功：' : '注销未成功：') + fmt(r.msg));
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '注销成功：' : '注销未成功：') + fmt(r.msg));
             return self.refresh();
         }).catch(function() { self.showMsg(false, '注销请求异常'); });
+    },
+
+    lineName: function(id) {
+        var l = (this.lines || []).filter(function(x) { return x.id === id; })[0];
+        return l && l.name ? l.name : id;
     },
 
     // 内联提示条：可手动关闭 + 6 秒自动消失
@@ -184,24 +206,37 @@ return view.extend({
 
     refresh: function() {
         var self = this;
-        return callQuery().then(function(res) {
+        return callStatus().then(function(res) {
             self.update(res || {});
         }).catch(function(e) {
-            self.update({ status: 'error', msg: '后端调用失败：' + (e && e.message ? e.message : e) });
+            self.update({ lines: [ { id: 'main', status: 'error', msg: '后端调用失败：' + (e && e.message ? e.message : e) } ] });
         });
     },
 
     update: function(res) {
         var root = document.getElementById('zzu-root');
-        if (root) dom.content(root, this.renderStatus(res));
+        if (root) dom.content(root, this.renderAll(res));
     },
 
-    // 横幅 + 悬浮统计卡
-    renderStatus: function(res) {
+    renderAll: function(res) {
+        var self = this;
+        res = res || {};
+        var lines = Array.isArray(res.lines) && res.lines.length ? res.lines : [ { id: 'main', status: 'error', msg: '无线路数据' } ];
+        this.lines = lines;
+        return lines.map(function(l) {
+            return E('div', { 'class': 'zzu-line' }, self.renderLine(l, res.ts, lines.length > 1));
+        });
+    },
+
+    // 单条线路：横幅 + 悬浮统计卡
+    renderLine: function(res, tsv, multi) {
         res = res || {};
         var st = res.status || 'error';
         var m = META[st] || META.error;
-        var ts = res.ts ? new Date(res.ts * 1000) : new Date();
+        var ts = tsv ? new Date(tsv * 1000) : new Date();
+        var id = res.id || 'main';
+        var pill = res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由';
+        var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
         var banner = E('div', { 'class': 'zzu-banner', 'style': 'background:' + m.grad }, [
             E('div', { 'class': 'zzu-banner-in' }, [
@@ -209,8 +244,8 @@ return view.extend({
                     E('div', { 'class': 'zzu-badge' + (m.pulse ? ' pulse' : '') }, m.icon),
                     E('div', { 'style': 'min-width:0' }, [
                         E('div', { 'class': 'zzu-title-row' }, [
-                            E('span', { 'class': 'zzu-title' }, m.label),
-                            E('span', { 'class': 'zzu-pill' }, '每 10 秒自动刷新')
+                            E('span', { 'class': 'zzu-title' }, title),
+                            E('span', { 'class': 'zzu-pill' }, multi ? pill : '每 10 秒自动刷新')
                         ]),
                         E('div', { 'class': 'zzu-sub' },
                             fmt(res.msg) + ' · 最近更新 ' + ts.toLocaleTimeString())
@@ -221,9 +256,9 @@ return view.extend({
                     E('button', {
                         'class': 'zzu-btn primary',
                         'style': 'color:' + m.accent,
-                        'click': ui.createHandlerFn(this, 'handleLogin')
+                        'click': ui.createHandlerFn(this, 'handleLogin', id)
                     }, '🔑 登录'),
-                    E('button', { 'class': 'zzu-btn', 'click': ui.createHandlerFn(this, 'handleLogout') }, '⏻ 注销')
+                    E('button', { 'class': 'zzu-btn', 'click': ui.createHandlerFn(this, 'handleLogout', id) }, '⏻ 注销')
                 ])
             ])
         ]);
@@ -242,8 +277,8 @@ return view.extend({
     },
 
     load: function() {
-        return callQuery().then(function(r) { return r || {}; }).catch(function() {
-            return { status: 'error', msg: '后端调用失败' };
+        return callStatus().then(function(r) { return r || {}; }).catch(function() {
+            return { lines: [ { id: 'main', status: 'error', msg: '后端调用失败' } ] };
         });
     },
 
@@ -262,22 +297,26 @@ return view.extend({
         o.placeholder = '172.16.4.14';
         o.default = '172.16.4.14';
 
-        o = s.option(form.Value, 'account', '账号', '学号 / 账号，不含运营商后缀（如 @cmcc）');
+        o = s.option(form.Value, 'account', '账号', '学号 / 账号，不含运营商后缀（如 @cmcc）；所有线路共用');
         o.placeholder = '请输入账号';
 
         o = s.option(form.Value, 'password', '密码', '明文填写，后台自动 base64 编码后提交');
         o.password = true;
 
-        o = s.option(form.ListValue, 'isp', '运营商');
-        o.value('campus', '校园网 (无后缀)');
-        o.value('cmcc', '中国移动 (@cmcc)');
-        o.value('unicom', '中国联通 (@unicom)');
-        o.value('telecom', '中国电信 (@telecom)');
-        o.value('zzuplan', '学科专网 (@zzuplan)');
-        o.default = 'campus';
+        o = s.option(form.Value, 'name', '主线路名称');
+        o.placeholder = '主线路';
+
+        o = s.option(widgets.NetworkSelect, 'iface', '主线路出口接口',
+            '留空 = 走系统默认路由（单线路时保持留空即可）');
+        o.nocreate = true;
+        o.optional = true;
+        o.rmempty = true;
+
+        o = s.option(form.ListValue, 'isp', '主线路运营商');
+        addIsp(o);
 
         o = s.option(form.Flag, 'auto_relogin', '每天定时重新授权',
-            '到点若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');
+            '到点对所有线路执行：若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');
         o.default = '0';
         o.rmempty = false;
 
@@ -285,6 +324,38 @@ return view.extend({
         o.placeholder = '06:00';
         o.default = '06:00';
         o.depends('auto_relogin', '1');
+
+        o = s.option(form.Flag, 'watchdog', '掉线自动重登',
+            '定期检查所有线路，发现未登录（认证服务器可达但离线）时自动重新登录');
+        o.default = '0';
+        o.rmempty = false;
+
+        o = s.option(form.Value, 'watchdog_interval', '检查间隔（分钟）', '1–59，默认 5');
+        o.datatype = 'range(1,59)';
+        o.placeholder = '5';
+        o.default = '5';
+        o.depends('watchdog', '1');
+
+        // 额外线路：同一账号在其它出口（如 macvlan 虚拟 WAN）以其它运营商认证
+        var ls = m.section(form.TableSection, 'line', '额外线路',
+            '同一账号可在不同出口同时登录不同运营商。每条线路需绑定一个已获取到校园网 IP 的接口（例如 macvlan 虚拟 WAN）。');
+        ls.anonymous = true;
+        ls.addremove = true;
+        ls.addbtntitle = '添加线路';
+
+        o = ls.option(form.Flag, 'enabled', '启用');
+        o.default = '1';
+        o.rmempty = false;
+
+        o = ls.option(form.Value, 'name', '名称');
+        o.placeholder = '如：移动下载';
+
+        o = ls.option(widgets.NetworkSelect, 'iface', '出口接口');
+        o.nocreate = true;
+        o.rmempty = false;
+
+        o = ls.option(form.ListValue, 'isp', '运营商');
+        addIsp(o);
 
         return m.render().then(function(mapEl) {
             poll.add(function() { return self.refresh(); }, 10);
@@ -314,7 +385,7 @@ return view.extend({
             return E('div', { 'class': 'zzu-page' }, [
                 E('style', { 'type': 'text/css' }, STYLE),
                 E('div', { 'id': 'zzu-msg' }),
-                E('div', { 'id': 'zzu-root' }, self.renderStatus(data)),
+                E('div', { 'id': 'zzu-root' }, self.renderAll(data)),
                 settings
             ]);
         });
@@ -325,13 +396,59 @@ ZZU_EOF_JS
 # ---------- 核心 CLI ----------
 cat > "$BIN" <<'ZZU_EOF_BIN'
 #!/bin/sh
-# zzucampusnetagent - 郑大校园网 eportal 命令行核心
-# 用法: zzucampusnetagent {query|login|logout|reauth}
+# zzucampusnetagent - 郑大校园网 eportal 命令行核心（支持多线路）
+#
+# 用法:
+#   zzucampusnetagent status              查询全部线路状态（JSON: {ts, lines:[...]}）
+#   zzucampusnetagent query  [线路]       查询单条线路（默认 main）
+#   zzucampusnetagent login  [线路]       登录单条线路（默认 main）
+#   zzucampusnetagent logout [线路]       注销单条线路（默认 main）
+#   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
+#   zzucampusnetagent watchdog            检查全部线路，离线的自动重新登录
+#
+# 线路: "main" 为主线路（UCI 的 config 段），其余为 UCI 中类型为 line 的段名。
+# 每条线路可绑定一个 netifd 逻辑接口（iface），请求会以该接口的 IP 为源地址发出，
+# 从而让同一账号在不同出口上分别以不同运营商认证。
 . /usr/share/libubox/jshn.sh
+. /lib/functions/network.sh
 
 CFG="zzucampusnetagent"
+TAG="zzucampusnetagent"
+LOCK="/var/lock/zzucampusnetagent.lock"
+
 cfg() { uci -q get "${CFG}.config.$1" 2>/dev/null; }
 base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
+
+# 线路 id 合法性（防注入）：只允许字母数字下划线
+valid_id() { case "$1" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
+
+# 读取线路属性：main → config 段，其它 → 同名 line 段
+lget() {
+	if [ "$1" = "main" ]; then cfg "$2"
+	else uci -q get "${CFG}.$1.$2" 2>/dev/null; fi
+}
+
+line_exists() {
+	[ "$1" = "main" ] && return 0
+	valid_id "$1" || return 1
+	[ "$(uci -q get "${CFG}.$1" 2>/dev/null)" = "line" ]
+}
+
+# 列出全部已启用线路（main 永远在第一个）
+line_ids() {
+	local id
+	echo main
+	for id in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+		[ "$(uci -q get "${CFG}.${id}.enabled" 2>/dev/null)" = "0" ] && continue
+		echo "$id"
+	done
+}
+
+line_name() {
+	local n; n=$(lget "$1" name)
+	[ -n "$n" ] && { echo "$n"; return; }
+	[ "$1" = "main" ] && echo "主线路" || echo "$1"
+}
 
 isp_suffix() {
 	case "$1" in
@@ -383,12 +500,34 @@ b64() {
 	fi
 }
 
+# 解析线路的出口源 IP，结果放在全局 BIND；ERR 为失败原因
+# 未绑定接口 → BIND 为空（走系统默认路由，兼容单线路旧用法）
+resolve_bind() {
+	local iface
+	BIND=""; ERR=""
+	iface=$(lget "$1" iface)
+	[ -z "$iface" ] && return 0
+	if ! command -v curl >/dev/null 2>&1; then
+		ERR="多线路绑定接口需要 curl（opkg/apk 安装 curl）"; return 1
+	fi
+	network_flush_cache
+	network_get_ipaddr BIND "$iface"
+	[ -n "$BIND" ] && return 0
+	ERR="接口 ${iface} 未获取到 IPv4 地址（检查该接口是否已连接）"
+	return 1
+}
+
+# fetch URL [源IP]
 fetch() {
 	local ref ua
 	ref="http://$(base)/"
 	ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 	if command -v curl >/dev/null 2>&1; then
-		curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
+		if [ -n "$2" ]; then
+			curl -s --max-time 8 --interface "$2" -A "$ua" -e "$ref" "$1" 2>/dev/null
+		else
+			curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
+		fi
 	elif command -v uclient-fetch >/dev/null 2>&1; then
 		uclient-fetch -q -T 8 -U "$ua" -O - "$1" 2>/dev/null
 	else
@@ -398,15 +537,24 @@ fetch() {
 
 strip_jsonp() { echo "$1" | sed -e 's/^[^(]*(//' -e 's/)[^)]*$//'; }
 
-cmd_query() {
-	local raw json result msg
-	raw=$(fetch "http://$(base):801/eportal/portal/custom")
-	json_init
-	json_add_int ts "$(date +%s)"
+# 向当前 json 对象写入线路查询结果字段
+add_query_fields() {
+	local id="$1" raw json result msg
+	json_add_string id    "$id"
+	json_add_string name  "$(line_name "$id")"
+	json_add_string iface "$(lget "$id" iface)"
+	json_add_string isp   "$(lget "$id" isp)"
+	if ! resolve_bind "$id"; then
+		json_add_string status "error"
+		json_add_string msg "$ERR"
+		return
+	fi
+	json_add_string bind "$BIND"
+	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
 	if [ -z "$raw" ]; then
 		json_add_string status "error"
 		json_add_string msg "无法连接认证服务器（确认路由器已接入校园网）"
-		json_dump; return
+		return
 	fi
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
@@ -425,12 +573,13 @@ cmd_query() {
 		json_add_string status "error"
 		json_add_string msg "${msg:-接口返回异常}"
 	fi
-	json_dump
 }
 
+# 纯文本状态：online / offline / error
 query_state() {
 	local raw json
-	raw=$(fetch "http://$(base):801/eportal/portal/custom")
+	resolve_bind "$1" || { echo "error"; return; }
+	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
 	[ -z "$raw" ] && { echo "error"; return; }
 	json=$(strip_jsonp "$raw")
 	case "$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)" in
@@ -438,21 +587,59 @@ query_state() {
 	esac
 }
 
-cmd_login() {
-	local account password isp suffix acct pwb64 url raw json result msg
-	account=$(cfg account); password=$(cfg password); isp=$(cfg isp)
-	suffix=$(isp_suffix "$isp")
+bad_line() {
 	json_init
 	json_add_int ts "$(date +%s)"
+	json_add_int result 0
+	json_add_string status "error"
+	json_add_string msg "线路不存在：$1"
+	json_dump
+}
+
+cmd_query() {
+	line_exists "$1" || { bad_line "$1"; return; }
+	json_init
+	json_add_int ts "$(date +%s)"
+	add_query_fields "$1"
+	json_dump
+}
+
+cmd_status() {
+	local id
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_array lines
+	for id in $(line_ids); do
+		json_add_object ""
+		add_query_fields "$id"
+		json_close_object
+	done
+	json_close_array
+	json_dump
+}
+
+cmd_login() {
+	local id="$1" account password suffix acct pwb64 url raw json result msg
+	line_exists "$id" || { bad_line "$id"; return; }
+	account=$(cfg account); password=$(cfg password)
+	suffix=$(isp_suffix "$(lget "$id" isp)")
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_string id "$id"
 	if [ -z "$account" ] || [ -z "$password" ]; then
 		json_add_int result 0
 		json_add_string msg "请先在下方设置账号和密码并保存"
 		json_dump; return
 	fi
+	if ! resolve_bind "$id"; then
+		json_add_int result 0
+		json_add_string msg "$ERR"
+		json_dump; return
+	fi
 	acct=$(urlencode ",0,${account}${suffix}")
 	pwb64=$(urlencode "$(b64 "$password")")
 	url="http://$(base):801/eportal/portal/login?user_account=${acct}&user_password=${pwb64}"
-	raw=$(fetch "$url")
+	raw=$(fetch "$url" "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
@@ -462,37 +649,72 @@ cmd_login() {
 }
 
 cmd_logout() {
-	local raw json result msg
-	raw=$(fetch "http://$(base):801/eportal/portal/logout")
+	local id="$1" raw json result msg
+	line_exists "$id" || { bad_line "$id"; return; }
+	json_init
+	json_add_int ts "$(date +%s)"
+	json_add_string id "$id"
+	if ! resolve_bind "$id"; then
+		json_add_int result 0
+		json_add_string msg "$ERR"
+		json_dump; return
+	fi
+	raw=$(fetch "http://$(base):801/eportal/portal/logout" "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
-	json_init
-	json_add_int ts "$(date +%s)"
 	json_add_int result "${result:-0}"
 	json_add_string msg "${msg:-注销请求失败}"
 	json_dump
 }
 
-cmd_reauth() {
-	local st
-	logger -t zzucampusnetagent "scheduled re-auth start"
-	st=$(query_state)
+reauth_one() {
+	local id="$1" st
+	st=$(query_state "$id")
 	if [ "$st" = "online" ]; then
-		cmd_logout >/dev/null 2>&1
-		logger -t zzucampusnetagent "logout done, sleep 1s then login"
+		cmd_logout "$id" >/dev/null 2>&1
 		sleep 1
 	fi
-	cmd_login >/dev/null 2>&1
-	logger -t zzucampusnetagent "scheduled re-auth finished (was: $st)"
+	cmd_login "$id" >/dev/null 2>&1
+	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(query_state "$id"))"
 }
 
+cmd_reauth() {
+	local id
+	exec 9>"$LOCK"; lock_fd
+	if [ -n "$1" ]; then
+		line_exists "$1" && reauth_one "$1"
+	else
+		logger -t "$TAG" "scheduled re-auth start"
+		for id in $(line_ids); do reauth_one "$id"; done
+	fi
+}
+
+# 离线（认证服务器可达但未登录）→ 自动登录；服务器不可达则不动作
+cmd_watchdog() {
+	local id st
+	exec 9>"$LOCK"; lock_fd
+	for id in $(line_ids); do
+		st=$(query_state "$id")
+		[ "$st" = "offline" ] || continue
+		cmd_login "$id" >/dev/null 2>&1
+		logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(query_state "$id")"
+	done
+}
+
+# 文件锁：避免定时重授权与掉线检测同时执行（flock 不可用则跳过加锁）
+# 注：BusyBox flock 不支持 -w 超时；每次请求自带 8s 超时，持锁时间有上限
+lock_fd() { command -v flock >/dev/null 2>&1 && flock -x 9 2>/dev/null; return 0; }
+
+line="${2:-main}"
 case "$1" in
-	query)  cmd_query ;;
-	login)  cmd_login ;;
-	logout) cmd_logout ;;
-	reauth) cmd_reauth ;;
-	*) echo "usage: $0 {query|login|logout|reauth}" >&2; exit 1 ;;
+	status)   cmd_status ;;
+	query)    cmd_query  "$line" ;;
+	login)    cmd_login  "$line" ;;
+	logout)   cmd_logout "$line" ;;
+	reauth)   cmd_reauth "$2" ;;
+	watchdog) cmd_watchdog ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog}" >&2; exit 1 ;;
 esac
 ZZU_EOF_BIN
 chmod +x "$BIN"
@@ -503,14 +725,19 @@ cat > "$RPCD" <<'ZZU_EOF_RPCD'
 BIN="/usr/sbin/zzucampusnetagent"
 case "$1" in
 	list)
-		echo '{ "query": { }, "login": { }, "logout": { } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" } }'
 		;;
 	call)
-		read -r _ 2>/dev/null
+		read -r input 2>/dev/null
+		[ -z "$input" ] && input='{}'
+		line=$(jsonfilter -s "$input" -e '@.line' 2>/dev/null)
+		# 线路 id 只允许字母数字下划线，其余一律按主线路处理
+		case "$line" in ""|*[!A-Za-z0-9_]*) line="main" ;; esac
 		case "$2" in
-			query)  "$BIN" query ;;
-			login)  "$BIN" login ;;
-			logout) "$BIN" logout ;;
+			status) "$BIN" status ;;
+			query)  "$BIN" query  "$line" ;;
+			login)  "$BIN" login  "$line" ;;
+			logout) "$BIN" logout "$line" ;;
 			*) echo '{}' ;;
 		esac
 		;;
@@ -525,9 +752,10 @@ START=99
 USE_PROCD=1
 CRON="/etc/crontabs/root"
 TAG="# zzucampusnetagent-reauth"
+TAG_WD="# zzucampusnetagent-watchdog"
 
 sync_cron() {
-	local enabled time hour min
+	local enabled time hour min wd iv
 	enabled=$(uci -q get zzucampusnetagent.config.auto_relogin)
 	time=$(uci -q get zzucampusnetagent.config.relogin_time)
 	[ -z "$time" ] && time="06:00"
@@ -536,11 +764,23 @@ sync_cron() {
 	[ -z "$min" ]  && min=0
 	hour=$(printf '%d' "$hour" 2>/dev/null || echo 6)
 	min=$(printf '%d' "$min" 2>/dev/null || echo 0)
+
+	wd=$(uci -q get zzucampusnetagent.config.watchdog)
+	iv=$(uci -q get zzucampusnetagent.config.watchdog_interval)
+	iv=$(printf '%d' "${iv:-5}" 2>/dev/null || echo 5)
+	[ "$iv" -lt 1 ] && iv=1
+	[ "$iv" -gt 59 ] && iv=59
+
 	mkdir -p /etc/crontabs
 	[ -f "$CRON" ] || touch "$CRON"
-	sed -i "\|$TAG|d" "$CRON"
+	sed -i -e "\|$TAG|d" -e "\|$TAG_WD|d" "$CRON"
 	if [ "$enabled" = "1" ]; then
 		echo "$min $hour * * * /usr/sbin/zzucampusnetagent reauth >/dev/null 2>&1 $TAG" >> "$CRON"
+	fi
+	if [ "$wd" = "1" ]; then
+		echo "*/$iv * * * * /usr/sbin/zzucampusnetagent watchdog >/dev/null 2>&1 $TAG_WD" >> "$CRON"
+	fi
+	if [ "$enabled" = "1" ] || [ "$wd" = "1" ]; then
 		/etc/init.d/cron enable >/dev/null 2>&1
 	fi
 	/etc/init.d/cron restart >/dev/null 2>&1
@@ -551,7 +791,7 @@ reload_service() { sync_cron; }
 boot()           { sync_cron; }
 
 stop_service() {
-	[ -f "$CRON" ] && sed -i "\|$TAG|d" "$CRON"
+	[ -f "$CRON" ] && sed -i -e "\|$TAG|d" -e "\|$TAG_WD|d" "$CRON"
 	/etc/init.d/cron restart >/dev/null 2>&1
 }
 
@@ -585,9 +825,10 @@ cat > "$ACL" <<'ZZU_EOF_ACL'
 		"description": "Grant access to ZZU campus network status & auth",
 		"read": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "query", "login", "logout" ]
+				"luci.zzucampusnetagent": [ "status", "query", "login", "logout" ],
+				"network.interface": [ "dump" ]
 			},
-			"uci": [ "zzucampusnetagent" ]
+			"uci": [ "zzucampusnetagent", "network" ]
 		},
 		"write": {
 			"ubus": {
@@ -606,9 +847,20 @@ config zzucampusnetagent 'config'
 	option baseurl '172.16.4.14'
 	option account ''
 	option password ''
+	option name '主线路'
+	option iface ''
 	option isp 'campus'
 	option auto_relogin '0'
 	option relogin_time '06:00'
+	option watchdog '0'
+	option watchdog_interval '5'
+
+# 额外线路示例（同一账号在另一个出口以其它运营商认证）：
+# config line
+#	option enabled '1'
+#	option name '移动下载'
+#	option iface 'wancm'
+#	option isp 'cmcc'
 ZZU_EOF_CFG
 fi
 
@@ -618,6 +870,8 @@ add_def baseurl 172.16.4.14
 add_def isp campus
 add_def auto_relogin 0
 add_def relogin_time 06:00
+add_def watchdog 0
+add_def watchdog_interval 5
 uci commit zzucampusnetagent
 
 # ---------- 生效 ----------

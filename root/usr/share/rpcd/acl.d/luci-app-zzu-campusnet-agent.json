@@ -3,9 +3,10 @@
 		"description": "Grant access to ZZU campus network status & auth",
 		"read": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "query", "login", "logout" ]
+				"luci.zzucampusnetagent": [ "status", "query", "login", "logout" ],
+				"network.interface": [ "dump" ]
 			},
-			"uci": [ "zzucampusnetagent" ]
+			"uci": [ "zzucampusnetagent", "network" ]
 		},
 		"write": {
 			"ubus": {

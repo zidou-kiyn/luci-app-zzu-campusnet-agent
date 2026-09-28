@@ -5,13 +5,17 @@
 'require poll';
 'require dom';
 'require ui';
+'require tools.widgets as widgets';
 
-var callQuery  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'query',  expect: { } });
-var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  expect: { } });
-var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', expect: { } });
+var callStatus = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'status', expect: { } });
+var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  params: [ 'line' ], expect: { } });
+var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', params: [ 'line' ], expect: { } });
 
 var STYLE = `
 .zzu-page{max-width:980px;margin:0 auto 24px}
+.zzu-line{margin-bottom:22px}
+.zzu-line:last-child{margin-bottom:0}
+.zzu-set-bd .cbi-section-table{margin-top:6px}
 .zzu-alert{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:12px;margin-bottom:16px;font-size:14px;font-weight:500;box-shadow:0 6px 18px rgba(50,50,93,.1);animation:zzuIn .22s ease}
 .zzu-alert.ok{background:#e7f6ef;color:#13855f;border:1px solid #c4ecda}
 .zzu-alert.err{background:#fdeaef;color:#c93a5d;border:1px solid #f7cad5}
@@ -87,27 +91,45 @@ var STATS = [
     { key: 'ip',       label: 'IP 地址',  icon: '🌐', bg: '#f0edfb' }
 ];
 
+var ISPS = [
+    [ 'campus',  '校园网 (无后缀)' ],
+    [ 'cmcc',    '中国移动 (@cmcc)' ],
+    [ 'unicom',  '中国联通 (@unicom)' ],
+    [ 'telecom', '中国电信 (@telecom)' ],
+    [ 'zzuplan', '学科专网 (@zzuplan)' ]
+];
+
 function fmt(v) { return (v === undefined || v === null || v === '') ? '—' : v; }
+
+function addIsp(o) {
+    ISPS.forEach(function(i) { o.value(i[0], i[1]); });
+    o.default = 'campus';
+}
 
 return view.extend({
     handleRefresh: function() { return this.refresh(); },
 
-    handleLogin: function() {
+    handleLogin: function(line) {
         var self = this;
-        return callLogin().then(function(r) {
+        return callLogin(line).then(function(r) {
             r = r || {};
-            self.showMsg(r.result == 1, (r.result == 1 ? '登录成功：' : '登录未成功：') + fmt(r.msg));
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '登录成功：' : '登录未成功：') + fmt(r.msg));
             return self.refresh();
         }).catch(function() { self.showMsg(false, '登录请求异常'); });
     },
 
-    handleLogout: function() {
+    handleLogout: function(line) {
         var self = this;
-        return callLogout().then(function(r) {
+        return callLogout(line).then(function(r) {
             r = r || {};
-            self.showMsg(r.result == 1, (r.result == 1 ? '注销成功：' : '注销未成功：') + fmt(r.msg));
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '注销成功：' : '注销未成功：') + fmt(r.msg));
             return self.refresh();
         }).catch(function() { self.showMsg(false, '注销请求异常'); });
+    },
+
+    lineName: function(id) {
+        var l = (this.lines || []).filter(function(x) { return x.id === id; })[0];
+        return l && l.name ? l.name : id;
     },
 
     // 内联提示条：可手动关闭 + 6 秒自动消失
@@ -128,24 +150,37 @@ return view.extend({
 
     refresh: function() {
         var self = this;
-        return callQuery().then(function(res) {
+        return callStatus().then(function(res) {
             self.update(res || {});
         }).catch(function(e) {
-            self.update({ status: 'error', msg: '后端调用失败：' + (e && e.message ? e.message : e) });
+            self.update({ lines: [ { id: 'main', status: 'error', msg: '后端调用失败：' + (e && e.message ? e.message : e) } ] });
         });
     },
 
     update: function(res) {
         var root = document.getElementById('zzu-root');
-        if (root) dom.content(root, this.renderStatus(res));
+        if (root) dom.content(root, this.renderAll(res));
     },
 
-    // 横幅 + 悬浮统计卡
-    renderStatus: function(res) {
+    renderAll: function(res) {
+        var self = this;
+        res = res || {};
+        var lines = Array.isArray(res.lines) && res.lines.length ? res.lines : [ { id: 'main', status: 'error', msg: '无线路数据' } ];
+        this.lines = lines;
+        return lines.map(function(l) {
+            return E('div', { 'class': 'zzu-line' }, self.renderLine(l, res.ts, lines.length > 1));
+        });
+    },
+
+    // 单条线路：横幅 + 悬浮统计卡
+    renderLine: function(res, tsv, multi) {
         res = res || {};
         var st = res.status || 'error';
         var m = META[st] || META.error;
-        var ts = res.ts ? new Date(res.ts * 1000) : new Date();
+        var ts = tsv ? new Date(tsv * 1000) : new Date();
+        var id = res.id || 'main';
+        var pill = res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由';
+        var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
         var banner = E('div', { 'class': 'zzu-banner', 'style': 'background:' + m.grad }, [
             E('div', { 'class': 'zzu-banner-in' }, [
@@ -153,8 +188,8 @@ return view.extend({
                     E('div', { 'class': 'zzu-badge' + (m.pulse ? ' pulse' : '') }, m.icon),
                     E('div', { 'style': 'min-width:0' }, [
                         E('div', { 'class': 'zzu-title-row' }, [
-                            E('span', { 'class': 'zzu-title' }, m.label),
-                            E('span', { 'class': 'zzu-pill' }, '每 10 秒自动刷新')
+                            E('span', { 'class': 'zzu-title' }, title),
+                            E('span', { 'class': 'zzu-pill' }, multi ? pill : '每 10 秒自动刷新')
                         ]),
                         E('div', { 'class': 'zzu-sub' },
                             fmt(res.msg) + ' · 最近更新 ' + ts.toLocaleTimeString())
@@ -165,9 +200,9 @@ return view.extend({
                     E('button', {
                         'class': 'zzu-btn primary',
                         'style': 'color:' + m.accent,
-                        'click': ui.createHandlerFn(this, 'handleLogin')
+                        'click': ui.createHandlerFn(this, 'handleLogin', id)
                     }, '🔑 登录'),
-                    E('button', { 'class': 'zzu-btn', 'click': ui.createHandlerFn(this, 'handleLogout') }, '⏻ 注销')
+                    E('button', { 'class': 'zzu-btn', 'click': ui.createHandlerFn(this, 'handleLogout', id) }, '⏻ 注销')
                 ])
             ])
         ]);
@@ -186,8 +221,8 @@ return view.extend({
     },
 
     load: function() {
-        return callQuery().then(function(r) { return r || {}; }).catch(function() {
-            return { status: 'error', msg: '后端调用失败' };
+        return callStatus().then(function(r) { return r || {}; }).catch(function() {
+            return { lines: [ { id: 'main', status: 'error', msg: '后端调用失败' } ] };
         });
     },
 
@@ -206,22 +241,26 @@ return view.extend({
         o.placeholder = '172.16.4.14';
         o.default = '172.16.4.14';
 
-        o = s.option(form.Value, 'account', '账号', '学号 / 账号，不含运营商后缀（如 @cmcc）');
+        o = s.option(form.Value, 'account', '账号', '学号 / 账号，不含运营商后缀（如 @cmcc）；所有线路共用');
         o.placeholder = '请输入账号';
 
         o = s.option(form.Value, 'password', '密码', '明文填写，后台自动 base64 编码后提交');
         o.password = true;
 
-        o = s.option(form.ListValue, 'isp', '运营商');
-        o.value('campus', '校园网 (无后缀)');
-        o.value('cmcc', '中国移动 (@cmcc)');
-        o.value('unicom', '中国联通 (@unicom)');
-        o.value('telecom', '中国电信 (@telecom)');
-        o.value('zzuplan', '学科专网 (@zzuplan)');
-        o.default = 'campus';
+        o = s.option(form.Value, 'name', '主线路名称');
+        o.placeholder = '主线路';
+
+        o = s.option(widgets.NetworkSelect, 'iface', '主线路出口接口',
+            '留空 = 走系统默认路由（单线路时保持留空即可）');
+        o.nocreate = true;
+        o.optional = true;
+        o.rmempty = true;
+
+        o = s.option(form.ListValue, 'isp', '主线路运营商');
+        addIsp(o);
 
         o = s.option(form.Flag, 'auto_relogin', '每天定时重新授权',
-            '到点若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');
+            '到点对所有线路执行：若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');
         o.default = '0';
         o.rmempty = false;
 
@@ -229,6 +268,38 @@ return view.extend({
         o.placeholder = '06:00';
         o.default = '06:00';
         o.depends('auto_relogin', '1');
+
+        o = s.option(form.Flag, 'watchdog', '掉线自动重登',
+            '定期检查所有线路，发现未登录（认证服务器可达但离线）时自动重新登录');
+        o.default = '0';
+        o.rmempty = false;
+
+        o = s.option(form.Value, 'watchdog_interval', '检查间隔（分钟）', '1–59，默认 5');
+        o.datatype = 'range(1,59)';
+        o.placeholder = '5';
+        o.default = '5';
+        o.depends('watchdog', '1');
+
+        // 额外线路：同一账号在其它出口（如 macvlan 虚拟 WAN）以其它运营商认证
+        var ls = m.section(form.TableSection, 'line', '额外线路',
+            '同一账号可在不同出口同时登录不同运营商。每条线路需绑定一个已获取到校园网 IP 的接口（例如 macvlan 虚拟 WAN）。');
+        ls.anonymous = true;
+        ls.addremove = true;
+        ls.addbtntitle = '添加线路';
+
+        o = ls.option(form.Flag, 'enabled', '启用');
+        o.default = '1';
+        o.rmempty = false;
+
+        o = ls.option(form.Value, 'name', '名称');
+        o.placeholder = '如：移动下载';
+
+        o = ls.option(widgets.NetworkSelect, 'iface', '出口接口');
+        o.nocreate = true;
+        o.rmempty = false;
+
+        o = ls.option(form.ListValue, 'isp', '运营商');
+        addIsp(o);
 
         return m.render().then(function(mapEl) {
             poll.add(function() { return self.refresh(); }, 10);
@@ -258,7 +329,7 @@ return view.extend({
             return E('div', { 'class': 'zzu-page' }, [
                 E('style', { 'type': 'text/css' }, STYLE),
                 E('div', { 'id': 'zzu-msg' }),
-                E('div', { 'id': 'zzu-root' }, self.renderStatus(data)),
+                E('div', { 'id': 'zzu-root' }, self.renderAll(data)),
                 settings
             ]);
         });
