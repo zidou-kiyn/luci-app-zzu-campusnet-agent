@@ -18,9 +18,13 @@ GW=10.172.255.254
 CM_GROUP=wancm                 # 移动组路由表（dual-isp-setup.sh 创建，id 100）
 LINES="wanct1 wanct2 wancm1 wancm2"
 
-# ── 固定 MAC（保持 DHCP 租约稳定），可用环境变量覆盖 ──
-MAC_WANCT2="${MAC_WANCT2:-02:00:00:00:00:02}"
-MAC_WANCM2="${MAC_WANCM2:-02:00:00:00:00:03}"
+# ── 固定 MAC（同一 MAC 续租同一 IP）：沿用已有配置，首次随机生成；可用环境变量覆盖 ──
+pick_mac() { # 设备名
+	local m; m=$(uci -q get "network.$1_dev.macaddr")
+	[ -n "$m" ] && echo "$m" || hexdump -n5 -e '"02" 5/1 ":%02x"' /dev/urandom
+}
+MAC_WANCT2="${MAC_WANCT2:-$(pick_mac wanct2)}"
+MAC_WANCM2="${MAC_WANCM2:-$(pick_mac wancm2)}"
 
 wan_zone() { uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p"; }
 
