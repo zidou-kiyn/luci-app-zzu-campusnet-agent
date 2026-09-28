@@ -13,6 +13,6 @@ config zzucampusnetagent 'config'
 # 额外线路示例（同一账号在另一个出口以其它运营商认证）：
 # config line
 #	option enabled '1'
-#	option name '移动下载'
-#	option iface 'wancm'
+#	option name '移动1'
+#	option iface 'wancm1'
 #	option isp 'cmcc'

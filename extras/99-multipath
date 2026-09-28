@@ -1,30 +1,29 @@
 #!/bin/sh
-# /etc/hotplug.d/iface/99-multipath
-# 电信组 (main): wanct + wanbt 多路负载均衡
-# 移动组 (cmcc): wancm + wancm2 多路负载均衡
+# /etc/hotplug.d/iface/99-multipath（由 quad-wan-setup.sh 安装）
+# 每条线路有自己的路由表（netifd ip4table，按源 IP 选表，保证源 IP 与出口一致）；
+# 这里只维护两个“组表”的多路默认路由：
+#   电信组 → main  表：wanct1 + wanct2
+#   移动组 → wancm 表：wancm1 + wancm2
+# 各线网关同为校园网网关，组表内没有直连路由，因此 nexthop 用 onlink。
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
 
 GW=10.172.255.254
 
 build() {
-    local tbl="$1"; shift
-    local NH="" n=0
-    while [ "$#" -ge 1 ]; do
-        local dev="$1"; shift
-        ip link show "$dev" up >/dev/null 2>&1 || continue
-        local myip
-        myip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}' | cut -d/ -f1)
-        [ -z "$myip" ] && continue
-        NH="$NH nexthop via $GW dev $dev weight 1"
-        n=$((n + 1))
-    done
-    [ $n -eq 0 ] && return
-    ip route del default table "$tbl" 2>/dev/null
-    eval ip route add default table "$tbl" $NH 2>/dev/null
-    logger -t multipath "$tbl: $n path(s)"
+	local tbl="$1" NH="" n=0 dev ip; shift
+	for dev in "$@"; do
+		ip link show "$dev" up >/dev/null 2>&1 || continue
+		ip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}')
+		[ -z "$ip" ] && continue
+		NH="$NH nexthop via $GW dev $dev weight 1 onlink"
+		n=$((n + 1))
+	done
+	while ip route del default table "$tbl" 2>/dev/null; do :; done
+	[ "$n" -gt 0 ] && ip route add default table "$tbl" $NH
+	logger -t multipath "$tbl: $n path(s)"
 }
 
 case "$INTERFACE" in
-    wan|wanbt)    build main wanct wanbt ;;
-    wancm|wancm2) build cmcc wancm wancm2 ;;
+	wanct1|wanct2) build main  wanct1 wanct2 ;;
+	wancm1|wancm2) build wancm wancm1 wancm2 ;;
 esac

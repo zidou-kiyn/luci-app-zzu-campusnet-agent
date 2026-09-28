@@ -292,7 +292,7 @@ return view.extend({
         o.rmempty = false;
 
         o = ls.option(form.Value, 'name', '名称');
-        o.placeholder = '如：移动下载';
+        o.placeholder = '如：移动1';
 
         o = ls.option(form.Value, 'account', '账号', '留空 = 用主账号');
         o.placeholder = '同主账号';

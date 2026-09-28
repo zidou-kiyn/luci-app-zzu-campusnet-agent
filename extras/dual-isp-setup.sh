@@ -14,19 +14,21 @@
 #    SSID=My-CMCC RADIO=radio1 SUBNET=192.168.32 ISP=cmcc sh dual-isp-setup.sh
 # ============================================================
 
-PARENT="${PARENT:-wan}"                 # 主 WAN 设备
-IFACE="${IFACE:-wancm}"                 # 虚拟 WAN 逻辑接口名 / 设备名
+# 命名约定：线路 = wan<运营商><序号>（逻辑接口名 = 设备名），如 wanct1 / wancm1；
+#           专用网段 = lan<运营商>，网桥 br-<网段>，防火墙区同名；运营商组路由表 = wan<运营商>
+PARENT="${PARENT:-wan}"                 # 物理 WAN 设备
+IFACE="${IFACE:-wancm1}"                # 虚拟 WAN 逻辑接口名 / 设备名
 LAN="${LAN:-lancm}"                     # 专用网段逻辑接口名
-BRIDGE="${BRIDGE:-br-cmcc}"
+BRIDGE="${BRIDGE:-br-$LAN}"
 SUBNET="${SUBNET:-192.168.32}"          # 专用网段 x.x.x.0/24，网关 .1
 TABLE_ID="${TABLE_ID:-100}"
-TABLE="${TABLE:-cmcc}"
-ZONE="${ZONE:-cmcc}"
+TABLE="${TABLE:-wancm}"                 # 该运营商的组路由表
+ZONE="${ZONE:-$LAN}"                    # 专用网段防火墙区
 RADIO="${RADIO:-radio1}"                # 挂在哪个射频上（radio1 通常为 5G）
 SSID="${SSID:-OpenWrt-CMCC-5G}"
 KEY="${KEY:-}"                          # 留空 = 沿用该射频上默认 WiFi 的密码
 ISP="${ISP:-cmcc}"
-NAME="${NAME:-移动下载}"
+NAME="${NAME:-移动1}"
 MAC="${MAC:-}"                          # 留空 = 首次随机生成并固定
 ENC="${ENC:-}"                          # 留空 = 支持 WPA3 则 sae-mixed，否则 psk2
 # 专用网段 DNS：两个 DoH 进程以专用用户运行，该用户的流量按 uidrange 规则走虚拟 WAN
@@ -36,9 +38,10 @@ DOH_PORT1="${DOH_PORT1:-5055}"; DOH_PORT2="${DOH_PORT2:-5056}"
 DNS_UID="${DNS_UID:-6053}"
 PLAIN_DNS="${PLAIN_DNS:-223.5.5.5 119.29.29.29}"   # 未装 https-dns-proxy 时的明文上游
 
-S="$(echo "$IFACE" | tr -c 'A-Za-z0-9_\n' '_')"   # UCI 段名前缀
-DNSI="$ZONE"                                        # 专用 dnsmasq 实例名
-DNSU="dns$ZONE"                                     # DoH 进程运行用户
+S="$(echo "$IFACE" | tr -c 'A-Za-z0-9_\n' '_')"   # 线路相关 UCI 段名前缀（macvlan、插件线路）
+L="$(echo "$LAN" | tr -c 'A-Za-z0-9_\n' '_')"     # 网段相关 UCI 段名前缀（网桥、规则、防火墙、WiFi、DNS）
+DNSI="${L}_dns"                                     # 专用 dnsmasq 实例名（不能与 dhcp.$LAN 重名）
+DNSU="dns$L"                                        # DoH 进程运行用户
 
 # 除专用实例外的 dnsmasq 段（主实例）
 other_dnsmasq() {
@@ -46,11 +49,11 @@ other_dnsmasq() {
 }
 
 if [ "$1" = "remove" ]; then
-	for c in "network.${S}_dev" "network.$IFACE" "network.${S}_br" "network.$LAN" \
-	         "network.${S}_rule" "network.${S}_strict" "network.${S}_main" \
-	         "network.${S}_dnsuid" "network.${S}_dnsuid_strict" \
-	         "dhcp.$LAN" "dhcp.$DNSI" "https-dns-proxy.${ZONE}_ali" "https-dns-proxy.${ZONE}_tx" \
-	         "firewall.${S}_zone" "firewall.${S}_fwd" "wireless.${S}_ap" \
+	for c in "network.${S}_dev" "network.$IFACE" "network.${L}_dev" "network.$LAN" \
+	         "network.${L}_rule" "network.${L}_strict" "network.main_suppress" \
+	         "network.${L}_dnsuid" "network.${L}_dnsuid_strict" \
+	         "dhcp.$LAN" "dhcp.$DNSI" "https-dns-proxy.${L}_ali" "https-dns-proxy.${L}_tx" \
+	         "firewall.$L" "firewall.${L}_wan" "wireless.${L}_ap" \
 	         "zzucampusnetagent.$S"; do
 		uci -q delete "$c"
 	done
@@ -101,14 +104,14 @@ uci set "network.$IFACE.ip4table=$TABLE"     # 路由进独立表，不影响主
 # 网桥必须有独立 MAC：只挂一个 WiFi 时网桥会沿用该 WiFi 接口的 MAC（=BSSID），
 # 在 NSS WiFi 卸载的高通平台上会导致客户端发给路由器的单播（含 ARP 应答）收不到，
 # 表现为能拿到 IP 但“无法访问互联网”
-BRMAC=$(uci -q get "network.${S}_br.macaddr")
+BRMAC=$(uci -q get "network.${L}_dev.macaddr")
 [ -z "$BRMAC" ] && BRMAC=$(hexdump -n5 -e '"02" 5/1 ":%02x"' /dev/urandom)
-uci -q delete "network.${S}_br"
-uci set "network.${S}_br=device"
-uci set "network.${S}_br.name=$BRIDGE"
-uci set "network.${S}_br.type=bridge"
-uci set "network.${S}_br.bridge_empty=1"
-uci set "network.${S}_br.macaddr=$BRMAC"
+uci -q delete "network.${L}_dev"
+uci set "network.${L}_dev=device"
+uci set "network.${L}_dev.name=$BRIDGE"
+uci set "network.${L}_dev.type=bridge"
+uci set "network.${L}_dev.bridge_empty=1"
+uci set "network.${L}_dev.macaddr=$BRMAC"
 
 uci -q delete "network.$LAN"
 uci set "network.$LAN=interface"
@@ -119,26 +122,26 @@ uci set "network.$LAN.ipaddr=$SUBNET.1/24"
 # 专用网段 → 独立表；表为空（虚拟 WAN 断开）时不可达，不回落主线路
 # 必须限定 in=$LAN（iif 网桥）：否则路由器自己以 $SUBNET.1 为源发给客户端的包
 # （DNS 应答、LuCI 等）也会命中该规则被送去 WAN，表现为能上网但系统提示“无法访问互联网”
-uci -q delete "network.${S}_rule"
-uci set "network.${S}_rule=rule"
-uci set "network.${S}_rule.in=$LAN"
-uci set "network.${S}_rule.src=$SUBNET.0/24"
-uci set "network.${S}_rule.lookup=$TABLE"
-uci set "network.${S}_rule.priority=1000"
-uci -q delete "network.${S}_strict"
-uci set "network.${S}_strict=rule"
-uci set "network.${S}_strict.in=$LAN"
-uci set "network.${S}_strict.src=$SUBNET.0/24"
-uci set "network.${S}_strict.action=unreachable"
-uci set "network.${S}_strict.priority=1001"
+uci -q delete "network.${L}_rule"
+uci set "network.${L}_rule=rule"
+uci set "network.${L}_rule.in=$LAN"
+uci set "network.${L}_rule.src=$SUBNET.0/24"
+uci set "network.${L}_rule.lookup=$TABLE"
+uci set "network.${L}_rule.priority=1000"
+uci -q delete "network.${L}_strict"
+uci set "network.${L}_strict=rule"
+uci set "network.${L}_strict.in=$LAN"
+uci set "network.${L}_strict.src=$SUBNET.0/24"
+uci set "network.${L}_strict.action=unreachable"
+uci set "network.${L}_strict.priority=1001"
 # netifd 会给 ip4table 接口加 "to <校园网子网> lookup 表"(优先级 20000)，
 # 会把路由器发往校园网内网的未绑定流量（含主线路 DHCP 续租）错送到虚拟 WAN；
 # 这里先查 main 表（忽略默认路由），让它们仍走主线路
-uci -q delete "network.${S}_main"
-uci set "network.${S}_main=rule"
-uci set "network.${S}_main.lookup=main"
-uci set "network.${S}_main.suppress_prefixlength=0"
-uci set "network.${S}_main.priority=15000"
+uci -q delete "network.main_suppress"
+uci set "network.main_suppress=rule"
+uci set "network.main_suppress.lookup=main"
+uci set "network.main_suppress.suppress_prefixlength=0"
+uci set "network.main_suppress.priority=15000"
 
 # 同网段双出口：防止主 WAN 代答虚拟 WAN 的 ARP（否则认证服务器看到的 MAC 会串）
 cat > /etc/sysctl.d/99-zzu-multiwan.conf <<'C'
@@ -155,21 +158,23 @@ if [ -x /etc/init.d/https-dns-proxy ]; then
 	. /lib/functions.sh
 	group_exists "$DNSU" || group_add "$DNSU" "$DNS_UID"
 	user_exists "$DNSU"  || user_add "$DNSU" "$DNS_UID" "$DNS_UID" "$DNSU" "/var/run/$DNSU" /bin/false
-	uci -q delete "network.${S}_dnsuid"
-	uci set "network.${S}_dnsuid=rule"
-	uci set "network.${S}_dnsuid.uidrange=$DNS_UID"
-	uci set "network.${S}_dnsuid.lookup=$TABLE"
-	uci set "network.${S}_dnsuid.priority=1002"
-	uci -q delete "network.${S}_dnsuid_strict"
-	uci set "network.${S}_dnsuid_strict=rule"
-	uci set "network.${S}_dnsuid_strict.uidrange=$DNS_UID"
-	uci set "network.${S}_dnsuid_strict.action=unreachable"
-	uci set "network.${S}_dnsuid_strict.priority=1003"
+	# 优先级须在 netifd 的“from <线路 IP> lookup <线路表>”(10000) 之后：TCP 建连时内核会带上
+	# 已选定的源 IP 重新查路由，若先命中本规则，多线路时可能换到另一条线（源 IP 与出口不一致）
+	uci -q delete "network.${L}_dnsuid"
+	uci set "network.${L}_dnsuid=rule"
+	uci set "network.${L}_dnsuid.uidrange=$DNS_UID"
+	uci set "network.${L}_dnsuid.lookup=$TABLE"
+	uci set "network.${L}_dnsuid.priority=12000"
+	uci -q delete "network.${L}_dnsuid_strict"
+	uci set "network.${L}_dnsuid_strict=rule"
+	uci set "network.${L}_dnsuid_strict.uidrange=$DNS_UID"
+	uci set "network.${L}_dnsuid_strict.action=unreachable"
+	uci set "network.${L}_dnsuid_strict.priority=12001"
 
 	# https-dns-proxy 默认会把所有 DoH 进程写进所有 dnsmasq 实例（主实例也会用上走虚拟 WAN 的 DoH），
 	# 改为不自动改写；主实例此前由它写入的 server=127.0.0.1#5053... 已持久化在 UCI 中，保持不变
 	uci set https-dns-proxy.config.dnsmasq_config_update='-'
-	for x in "${ZONE}_ali $DOH1_URL $DOH1_BOOT $DOH_PORT1" "${ZONE}_tx $DOH2_URL $DOH2_BOOT $DOH_PORT2"; do
+	for x in "${L}_ali $DOH1_URL $DOH1_BOOT $DOH_PORT1" "${L}_tx $DOH2_URL $DOH2_BOOT $DOH_PORT2"; do
 		set -- $x
 		uci -q delete "https-dns-proxy.$1"
 		uci set "https-dns-proxy.$1=https-dns-proxy"
@@ -192,8 +197,8 @@ done
 uci -q delete "dhcp.$DNSI"
 uci set "dhcp.$DNSI=dnsmasq"
 for kv in domainneeded=1 boguspriv=1 localise_queries=1 rebind_protection=1 rebind_localhost=1 \
-          local=/$ZONE/ domain=$ZONE expandhosts=1 authoritative=1 readethers=0 \
-          leasefile=/tmp/dhcp.leases.$ZONE noresolv=1 localuse=0 localservice=1 \
+          local=/$L/ domain=$L expandhosts=1 authoritative=1 readethers=0 \
+          leasefile=/tmp/dhcp.leases.$L noresolv=1 localuse=0 localservice=1 \
           cachesize=10000 dnsforwardmax=1000 filter_aaaa=1 ednspacket_max=1232; do
 	uci set "dhcp.$DNSI.${kv%%=*}=${kv#*=}"
 done
@@ -215,37 +220,37 @@ uci set "dhcp.$LAN.leasetime=12h"
 # ---- firewall ----
 Z=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
 uci -q get "firewall.$Z.network" | grep -qw "$IFACE" || uci add_list "firewall.$Z.network=$IFACE"
-uci -q delete "firewall.${S}_zone"
-uci set "firewall.${S}_zone=zone"
-uci set "firewall.${S}_zone.name=$ZONE"
-uci add_list "firewall.${S}_zone.network=$LAN"
-uci set "firewall.${S}_zone.input=ACCEPT"
-uci set "firewall.${S}_zone.output=ACCEPT"
-uci set "firewall.${S}_zone.forward=REJECT"
-uci -q delete "firewall.${S}_fwd"
-uci set "firewall.${S}_fwd=forwarding"
-uci set "firewall.${S}_fwd.src=$ZONE"
-uci set "firewall.${S}_fwd.dest=wan"
+uci -q delete "firewall.$L"
+uci set "firewall.$L=zone"
+uci set "firewall.$L.name=$ZONE"
+uci add_list "firewall.$L.network=$LAN"
+uci set "firewall.$L.input=ACCEPT"
+uci set "firewall.$L.output=ACCEPT"
+uci set "firewall.$L.forward=REJECT"
+uci -q delete "firewall.${L}_wan"
+uci set "firewall.${L}_wan=forwarding"
+uci set "firewall.${L}_wan.src=$ZONE"
+uci set "firewall.${L}_wan.dest=wan"
 
 # ---- wireless ----
 if [ -z "$KEY" ]; then
 	KEY=$(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.device='$RADIO'$/\1/p" | while read -r sec; do
 		uci -q get "wireless.$sec.key" && break; done)
 fi
-uci -q delete "wireless.${S}_ap"
-uci set "wireless.${S}_ap=wifi-iface"
-uci set "wireless.${S}_ap.device=$RADIO"
-uci set "wireless.${S}_ap.network=$LAN"
-uci set "wireless.${S}_ap.mode=ap"
-uci set "wireless.${S}_ap.ssid=$SSID"
+uci -q delete "wireless.${L}_ap"
+uci set "wireless.${L}_ap=wifi-iface"
+uci set "wireless.${L}_ap.device=$RADIO"
+uci set "wireless.${L}_ap.network=$LAN"
+uci set "wireless.${L}_ap.mode=ap"
+uci set "wireless.${L}_ap.ssid=$SSID"
 if [ -z "$ENC" ]; then
 	hostapd -vsae >/dev/null 2>&1 && ENC=sae-mixed || ENC=psk2
 fi
 if [ -n "$KEY" ]; then
-	uci set "wireless.${S}_ap.encryption=$ENC"
-	uci set "wireless.${S}_ap.key=$KEY"
+	uci set "wireless.${L}_ap.encryption=$ENC"
+	uci set "wireless.${L}_ap.key=$KEY"
 else
-	uci set "wireless.${S}_ap.encryption=none"
+	uci set "wireless.${L}_ap.encryption=none"
 fi
 
 # ---- 插件：额外线路 + 掉线自动重登 ----

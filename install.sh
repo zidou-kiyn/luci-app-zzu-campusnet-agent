@@ -348,7 +348,7 @@ return view.extend({
         o.rmempty = false;
 
         o = ls.option(form.Value, 'name', '名称');
-        o.placeholder = '如：移动下载';
+        o.placeholder = '如：移动1';
 
         o = ls.option(widgets.NetworkSelect, 'iface', '出口接口');
         o.nocreate = true;
@@ -858,8 +858,8 @@ config zzucampusnetagent 'config'
 # 额外线路示例（同一账号在另一个出口以其它运营商认证）：
 # config line
 #	option enabled '1'
-#	option name '移动下载'
-#	option iface 'wancm'
+#	option name '移动1'
+#	option iface 'wancm1'
 #	option isp 'cmcc'
 ZZU_EOF_CFG
 fi

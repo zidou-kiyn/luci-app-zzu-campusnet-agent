@@ -5,7 +5,7 @@
 - 🟢 每 **10 秒** 自动查询并显示在线状态（账号 / 运营商 / 时长 / IP），带 **手动刷新** 按钮
 - 🔑 **一键登录 / 注销**（portal 认证）
 - ⏰ **每天定时重新授权**：到点若在线则先注销、隔 1 秒再登录，保证授权不掉线（默认凌晨 06:00）
-- 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信日常 + 移动下载），每条线路独立显示状态、独立登录/注销
+- 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信1 + 移动1），每条线路独立显示状态、独立登录/注销
 - 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
 - ⚙ **UI 内可改**：服务器地址 baseurl、账号、密码、运营商（移动/联通/电信/校园网/学科专网）、定时开关与时间
 - 🎨 Argon Design 配色卡片风，贴近 argon 主题
@@ -31,15 +31,19 @@
 
 ---
 
-## 双运营商分流（电信日常 + 移动下载）
+## 双运营商分流（电信1 + 移动1）
 
 实测郑大校园网允许**同一账号在两个 IP 上同时在线且运营商不同**。一根网线即可实现：
 
 ```
-                    ┌─ wan   (原 MAC, 10.172.a.b) ── 电信 ── OpenWrt-2.4G / OpenWrt-5G / 有线 LAN (192.168.31.0/24)
+                    ┌─ wanct1 (原 MAC, 10.172.a.b) ── 电信 ── OpenWrt-2.4G / OpenWrt-5G / 有线 LAN   lan   (192.168.31.0/24)
 校园网网线 ── wan ──┤
-                    └─ wancm (macvlan, 10.172.c.d) ── 移动 ── OpenWrt-CMCC-5G (192.168.32.0/24)
+                    └─ wancm1 (macvlan, 10.172.c.d) ── 移动 ── OpenWrt-CMCC-5G                 lancm (192.168.32.0/24)
 ```
+
+命名约定：线路 = `wan<运营商><序号>`（逻辑接口名与设备名相同），专用网段 = `lan<运营商>`，
+网桥 `br-<网段>`，防火墙区域与网段同名，运营商组路由表 = `wan<运营商>`。
+（只运行 `dual-isp-setup.sh` 时主线路仍是默认的 `wan`，运行 `dual-isp-sqm.sh` 后改名为 `wanct1`。）
 
 一键配置（在路由器上，需已装本插件；依赖 `kmod-macvlan`、`curl`）：
 
@@ -54,33 +58,36 @@ ssh root@192.168.31.1 sh /root/dual-isp-setup.sh remove   # 移除
 
 | 项 | 说明 |
 |----|------|
-| macvlan `wancm` | 在 `wan` 上建第二个 MAC，DHCP 拿第二个校园网 IP；MAC 固定，续租 IP 不变 |
-| 路由表 `cmcc`(100) | `wancm` 的路由只进这张表，主线路默认路由不受影响 |
-| 策略路由 | 从移动 WiFi 进来（`iif br-cmcc`）的 `192.168.32.0/24` 查 `cmcc` 表；表空（移动断线）时**直接不可达、不回落电信**。必须限定 iif，否则路由器发给客户端的 DNS 应答也会被送去 WAN |
-| `suppress_prefixlength` 规则 | 修正 netifd 自动加的 `to 10.172.0.0/16 lookup cmcc`，防止主线路 DHCP 续租等内网流量错走移动 |
+| macvlan `wancm1` | 在 `wan` 上建第二个 MAC，DHCP 拿第二个校园网 IP；MAC 固定，续租 IP 不变 |
+| 路由表 `wancm`(100) | `wancm1` 的路由只进这张表，主线路默认路由不受影响 |
+| 策略路由 | 从移动 WiFi 进来（`iif br-lancm`）的 `192.168.32.0/24` 查 `wancm` 表；表空（移动断线）时**直接不可达、不回落电信**。必须限定 iif，否则路由器发给客户端的 DNS 应答也会被送去 WAN |
+| `suppress_prefixlength` 规则 | 修正 netifd 自动加的 `to 10.172.0.0/16 lookup wancm`，防止主线路 DHCP 续租等内网流量错走移动 |
 | `arp_ignore=1 / arp_announce=2` | 同网段双出口防 ARP 串线（否则认证服务器看到的 MAC 会错） |
-| 防火墙 | 新区域 `cmcc` → `wan`（`wancm` 加入 wan 区域做 NAT），与主 LAN 隔离 |
-| DNS | 移动网段用**独立 dnsmasq 实例**（`dhcp.cmcc`），上游为经移动出口的**公共加密 DNS**（阿里 / 腾讯 DoH），CDN 按移动调度。详见下方 |
+| 防火墙 | 新区域 `lancm` → `wan`（`wancm1` 加入 wan 区域做 NAT），与主 LAN 隔离 |
+| DNS | 移动网段用**独立 dnsmasq 实例**（`dhcp.lancm_dns`），上游为经移动出口的**公共加密 DNS**（阿里 / 腾讯 DoH），CDN 按移动调度。详见下方 |
 | DHCP | 由移动 dnsmasq 实例提供，客户端 DNS 即路由器（`192.168.32.1`） |
 | WiFi | 5G 射频上新增 `OpenWrt-CMCC-5G`，密码沿用该射频原 WiFi；支持时用 WPA2/WPA3 混合（`ENC` 可覆盖）；网桥使用独立 MAC（不能与 WiFi 接口/BSSID 相同） |
-| 插件 | 添加额外线路 `wancm`（@cmcc），开启掉线自动重登 |
+| 插件 | 添加额外线路 `wancm1`「移动1」（@cmcc），开启掉线自动重登 |
 
 > 说明：没有外部服务器时，**单个连接无法叠加两条线路带宽**；这里是按 WiFi 固定分流。
 
 ### 两个网段各自的加密 DNS
 
 ```
-电信局域网 → dnsmasq 主实例 → https-dns-proxy :5053/:5054（用户 nobody）  → 电信出口 → 阿里/腾讯 DoH
-移动 WiFi  → dnsmasq cmcc 实例 → https-dns-proxy :5055/:5056（用户 dnscmcc）→ 移动出口 → 阿里/腾讯 DoH
+电信局域网 → dnsmasq 主实例      → https-dns-proxy :5053/:5054（用户 nobody）   → 电信出口 → 阿里/腾讯 DoH
+移动 WiFi  → dnsmasq lancm_dns 实例 → https-dns-proxy :5055/:5056（用户 dnslancm）→ 移动出口 → 阿里/腾讯 DoH
 ```
 
-- 移动的两个 DoH 进程以专用用户 `dnscmcc`（uid 6053）运行，策略规则 `uidrange 6053 lookup cmcc`
-  让它们的流量走移动出口；按用户而非 IP 匹配，`wancm` 换 IP 也无需改配置。移动断线时该用户流量不可达，不会漏到电信
+- 移动的两个 DoH 进程以专用用户 `dnslancm`（uid 6053）运行，策略规则 `uidrange 6053 lookup wancm`（优先级 12000）
+  让它们的流量走移动出口；按用户而非 IP 匹配，`wancm1` 换 IP 也无需改配置。移动断线时该用户流量不可达，不会漏到电信。
+  该规则必须排在 netifd 的 `from <线路IP>`（10000）之后，否则多线路时 TCP 建连中途可能换线
 - DoH 服务端看到的是移动出口 IP，因此返回移动的 CDN 节点（实测 `dldir1.qq.com`：电信实例 → `123.54.x`，移动实例 → `111.42.x`）
 - https-dns-proxy 默认会把**所有** DoH 进程写进**所有** dnsmasq 实例，脚本将其 `dnsmasq_config_update` 设为 `-`（不自动改写），
   两个实例的上游各自固定
 - 两个实例都开启 `all-servers`（并发问两家取最快）与 `use-stale-cache`（缓存过期先返回再后台刷新）
-- 未安装 https-dns-proxy 时，移动实例退化为绑定 `wancm` 的明文公共 DNS（`223.5.5.5@wancm`）
+- 未安装 https-dns-proxy 时，移动实例退化为绑定 `wancm1` 的明文公共 DNS（`223.5.5.5@wancm1`）
+- 主实例全走 DoH 时，建议让 NTP 域名走明文 DNS，避免开机时间不准 → DoH 证书校验失败 → 无法解析 NTP 的死锁：
+  `uci add_list dhcp.@dnsmasq[0].server='/ntp.aliyun.com/ntp1.aliyun.com/ntp.tencent.com/223.5.5.5'`
 
 可选：给主实例也加上缓存 / 并发优化（日志出现 `Maximum number of concurrent DNS queries reached` 时建议）：
 
@@ -93,8 +100,8 @@ uci commit dhcp; /etc/init.d/dnsmasq restart
 ### 分线路限速（SQM）
 
 macvlan 的流量会先经过父设备 `wan` 的 tc ingress，SQM 挂在 `wan` 或物理口上会把两条线路算在一起。
-`extras/dual-isp-sqm.sh` 把主线路也挪到 macvlan `wanct`（沿用原 WAN MAC，物理口换随机 MAC），
-然后给 `wanct`、`wancm` 各建一个 cake 队列，并开启全核 RPS（`packet_steering=2`）：
+`extras/dual-isp-sqm.sh` 把主线路也挪到 macvlan `wanct1`（沿用原 WAN MAC，物理口换随机 MAC；
+逻辑接口同时由 `wan` 改名为 `wanct1`），然后给 `wanct1`、`wancm1` 各建一个 cake 队列，并开启全核 RPS（`packet_steering=2`）：
 
 ```sh
 scp extras/dual-isp-sqm.sh root@192.168.31.1:/root/
@@ -107,7 +114,32 @@ ssh root@192.168.31.1 sh /root/dual-isp-sqm.sh remove    # 还原
 
 > 性能参考（2 核 A53 @1GHz）：单线路跑满无压力；两条线同时满载时 CPU 基本吃满，
 > 路由器本机测速总吞吐约 230M（不开 SQM 约 270M）。CPU 不够时可在 LuCI → 网络 → SQM QoS
-> 把两个队列取消启用，或 `uci set sqm.wanct.enabled=0; uci set sqm.wancm.enabled=0; uci commit sqm; /etc/init.d/sqm stop`。
+> 把两个队列取消启用，或 `uci set sqm.wanct1.enabled=0; uci set sqm.wancm1.enabled=0; uci commit sqm; /etc/init.d/sqm stop`。
+
+### 四线聚合（电信1+电信2 / 移动1+移动2）
+
+在双线基础上再各加一条同运营商线路，组内按连接负载均衡（`extras/quad-wan-setup.sh`，需先运行上面两个脚本）：
+
+```
+电信组 → 主 LAN：wanct1（A号）+ wanct2（B号）   组表 main
+移动组 → lancm ：wancm1（A号）+ wancm2（A号）   组表 wancm
+```
+
+```sh
+scp extras/quad-wan-setup.sh root@192.168.31.1:/root/
+ssh root@192.168.31.1 "ACCT_B=<B号账号> PASS_B=<B号密码> sh /root/quad-wan-setup.sh"   # 安装
+ssh root@192.168.31.1 sh /root/quad-wan-setup.sh remove                                # 回到双线
+```
+
+| 项 | 说明 |
+|----|------|
+| 每线一张路由表 | `wanct1`~`wancm2`(101~104)，netifd 自动加 `from <线路IP> lookup <线路表>`，保证路由器自身发出的包源 IP 与出口一致。校园网按 MAC 识别会话，不一致时认证请求会算到另一条线上（看门狗误判、登录串号） |
+| 组表 | 只放多路默认路由，由 `/etc/hotplug.d/iface/99-multipath`（即 `extras/99-multipath`）在线路上下线时重建；nexthop 用 `onlink`，全部断开时删除默认路由 |
+| 多路哈希 | `fib_multipath_hash_policy=1` 按连接分摊，单任务多线程下载可叠加；同组线路出口 IP 相同，换线不掉网站登录 |
+| 认证 | 主线路绑定 `wanct1`；新增线路「电信2」（B 号）、「移动2」（继承主账号） |
+
+> 注意：netifd 停止时不会删除 macvlan，残留设备会导致同名设备认领失败（`DEVICE_CLAIM_FAILED`）或新设备套不上原 MAC。
+> 脚本重启网络时先 `network stop`、删掉各线路设备再 `start`；手动改线路名时也应这样做。
 
 ### 关闭 IPv6
 
@@ -134,6 +166,8 @@ uci commit network; /etc/init.d/network reload
 | `/etc/init.d/zzucampusnetagent` | 按配置同步 cron 定时任务（procd reload 触发） |
 | `/etc/config/zzucampusnetagent` | UCI 配置：`config` 段为共用账号 + 主线路；`line` 段为额外线路（iface/isp） |
 | `extras/dual-isp-setup.sh` | （不随包安装）双运营商分流一键配置脚本 |
+| `extras/dual-isp-sqm.sh` | （不随包安装）主线路改 macvlan + 分线路 SQM |
+| `extras/quad-wan-setup.sh` / `99-multipath` | （不随包安装）四线聚合 + 组表多路默认路由 hotplug |
 | `htdocs/.../view/zzucampusnetagent/status.js` | LuCI 前端：状态卡片 + 操作按钮 + 设置表单 |
 | `menu.d` / `acl.d` | 菜单（服务下）与权限 |
 
@@ -240,7 +274,7 @@ make package/luci-app-zzu-campusnet-agent/compile V=s
 
 ```sh
 zzucampusnetagent status          # 全部线路状态 JSON
-zzucampusnetagent query [线路]    # 单条线路状态（默认 main；额外线路用段名，如 wancm）
+zzucampusnetagent query [线路]    # 单条线路状态（默认 main；额外线路用段名，如 wancm1）
 zzucampusnetagent login [线路]    # 用已保存配置登录
 zzucampusnetagent logout [线路]   # 注销
 zzucampusnetagent reauth [线路]   # “注销→隔1s→登录”；不带参数 = 全部线路

@@ -4,9 +4,11 @@
 #
 #  为什么要把主线路也改成 macvlan：
 #    macvlan 的流量会先经过父设备 wan 的 tc ingress 钩子，SQM 直接挂在 wan
-#    或物理口上会把两条线路的流量算在一起。把主线路也挪到 macvlan（wanct）后，
+#    或物理口上会把两条线路的流量算在一起。把主线路也挪到 macvlan（wanct1）后，
 #    wan 只做“底座”不带 IP，每条线路的 SQM 只看得到自己的流量。
-#    wanct 沿用原 WAN 的 MAC（wan 本身换成随机 MAC），因此主线路 IP / 认证不变。
+#    wanct1 沿用原 WAN 的 MAC（wan 本身换成随机 MAC），因此主线路 IP / 认证不变。
+#    主线路逻辑接口同时从 wan 改名为 wanct1（与设备同名），防火墙 wan 区域、dhcp 段随之更新；
+#    若有其它软件按逻辑名引用 wan（如 upnp / ddns），需改成 wanct1。
 #
 #  用法（在路由器上）：  sh dual-isp-sqm.sh           安装/更新
 #                        sh dual-isp-sqm.sh remove    还原（主线路回到 wan，删除两条 SQM）
@@ -15,9 +17,10 @@
 # ============================================================
 
 PARENT="${PARENT:-wan}"          # 物理 WAN 设备
-MAIN="${MAIN:-wan}"              # 主线路逻辑接口
-MAIN_DEV="${MAIN_DEV:-wanct}"    # 主线路新 macvlan 设备名
-CM_DEV="${CM_DEV:-wancm}"        # 第二线路 macvlan 设备名（dual-isp-setup.sh 创建）
+MAIN_OLD="${MAIN_OLD:-wan}"      # 主线路原逻辑接口名
+MAIN="${MAIN:-wanct1}"           # 主线路新逻辑接口名
+MAIN_DEV="${MAIN_DEV:-$MAIN}"    # 主线路新 macvlan 设备名（与逻辑名一致）
+CM_DEV="${CM_DEV:-wancm1}"       # 第二线路 macvlan 设备名（dual-isp-setup.sh 创建）
 CT_DOWN="${CT_DOWN:-142000}"; CT_UP="${CT_UP:-50000}"
 CM_DOWN="${CM_DOWN:-285000}"; CM_UP="${CM_UP:-50000}"
 
@@ -32,6 +35,23 @@ parent_sec() {
 		s="$PS"; uci set "network.$s=device"; uci set "network.$s.name=$PARENT"
 	fi
 	echo "$s"
+}
+
+# 逻辑接口改名，并同步防火墙 wan 区域与 dhcp 段里的引用
+rename_iface() { # from to
+	local z d
+	uci -q get "network.$1" >/dev/null || return 0
+	uci -q get "network.$2" >/dev/null && return 0
+	uci rename "network.$1=$2"
+	z=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
+	if [ -n "$z" ] && uci -q get "firewall.$z.network" | grep -qw "$1"; then
+		uci del_list "firewall.$z.network=$1"; uci add_list "firewall.$z.network=$2"
+	fi
+	for d in $(uci show dhcp | sed -n "s/^dhcp\.\([^.]*\)\.interface='$1'$/\1/p"); do
+		uci set "dhcp.$d.interface=$2"
+		[ "$d" = "$1" ] && uci rename "dhcp.$d=$2"
+	done
+	uci commit firewall; uci commit dhcp
 }
 
 del_sqm() {
@@ -61,12 +81,13 @@ P=$(parent_sec)
 if [ "$1" = "remove" ]; then
 	MAC=$(uci -q get "network.$MS.macaddr")
 	uci -q delete "network.$MS"
+	rename_iface "$MAIN" "$MAIN_OLD"; MAIN="$MAIN_OLD"
 	uci set "network.$MAIN.device=$PARENT"
 	uci -q get network.wan6 >/dev/null && uci set "network.wan6.device=$PARENT"
 	uci -q delete "network.$P.macaddr"
 	del_sqm
 	uci commit network; uci commit sqm
-	/etc/init.d/sqm stop; /etc/init.d/network reload; /etc/init.d/sqm start
+	/etc/init.d/sqm stop; /etc/init.d/network reload; /etc/init.d/firewall reload; /etc/init.d/sqm start
 	echo "==> 已还原：主线路回到 $PARENT（原 MAC ${MAC:-未知}）。如需整体限速请在 LuCI → 网络 → SQM 重新配置。"
 	exit 0
 fi
@@ -88,6 +109,7 @@ uci set "network.$MS.mode=bridge"
 uci set "network.$MS.macaddr=$MAC"
 [ "$(uci -q get "network.$P.ipv6")" = "0" ] && uci set "network.$MS.ipv6=0"
 
+rename_iface "$MAIN_OLD" "$MAIN"
 uci set "network.$MAIN.device=$MAIN_DEV"
 uci -q get network.wan6 >/dev/null && uci set "network.wan6.device=$MAIN_DEV"
 
@@ -102,6 +124,7 @@ add_sqm "$CM_DEV"   "$CM_DEV"   "$CM_DOWN" "$CM_UP"
 uci commit network; uci commit sqm
 /etc/init.d/sqm stop
 /etc/init.d/network reload
+/etc/init.d/firewall reload
 
 . /lib/functions/network.sh
 i=0; ADDR=""
