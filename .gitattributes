@@ -1,0 +1,2 @@
+# 本仓库文件都运行在 OpenWrt 上，统一使用 LF 换行（Windows 检出不转 CRLF，避免 sh 报错）
+* text=auto eol=lf
