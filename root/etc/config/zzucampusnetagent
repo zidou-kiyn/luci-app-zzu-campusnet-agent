@@ -4,6 +4,9 @@ config zzucampusnetagent 'config'
 	option relogin_time '06:00'
 	option watchdog '0'
 	option watchdog_interval '5'
+	# 外网检测：认证在线的线路再以该线路 IP 请求 probe_url（须返回 HTTP 204），不通则判定外网不通
+	option probe '1'
+	# list probe_url 'http://connect.rom.miui.com/generate_204'
 
 # 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；
 # iface 留空 = 走系统默认路由（单线路时保持留空即可）；account/password 每条线路各自填写。

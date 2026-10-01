@@ -2,7 +2,7 @@
 BIN="/usr/sbin/zzucampusnetagent"
 case "$1" in
 	list)
-		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" } }'
 		;;
 	call)
 		read -r input 2>/dev/null
@@ -15,6 +15,7 @@ case "$1" in
 			query)  "$BIN" query  "$line" ;;
 			login)  "$BIN" login  "$line" ;;
 			logout) "$BIN" logout "$line" ;;
+			reauth) "$BIN" relogin "$line" ;;
 			*) echo '{}' ;;
 		esac
 		;;

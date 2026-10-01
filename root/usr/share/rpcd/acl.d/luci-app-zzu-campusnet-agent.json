@@ -10,7 +10,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "login", "logout" ]
+				"luci.zzucampusnetagent": [ "login", "logout", "reauth" ]
 			},
 			"uci": [ "zzucampusnetagent" ]
 		}

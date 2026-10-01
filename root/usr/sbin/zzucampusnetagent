@@ -7,13 +7,18 @@
 #   zzucampusnetagent login  [线路]       登录单条线路（默认第一条）
 #   zzucampusnetagent logout [线路]       注销单条线路（默认第一条）
 #   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
-#   zzucampusnetagent watchdog            检查全部线路，离线的自动重新登录
+#   zzucampusnetagent relogin [线路]      同 reauth（单条线路），输出登录结果 JSON（供页面调用）
+#   zzucampusnetagent watchdog            检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登
 #   zzucampusnetagent migrate             把旧版配置迁移为新版（见 migrate()）
 #
 # 线路: UCI 中类型为 line 的段，段名即线路 id（旧版主线路迁移后为 "main"），
 # 每条线路自带 account/password。config 段只存全局设置：服务器地址、定时重授权、掉线检测。
 # 每条线路可绑定一个 netifd 逻辑接口（iface），请求会以该接口的 IP 为源地址发出，
 # 从而让同一账号在不同出口上分别以不同运营商认证；iface 留空则走系统默认路由。
+#
+# 外网检测（config.probe，默认开启）：认证服务器只记录“登录过”，运营商侧会话失效后
+# 仍会返回在线。因此对“在线”的线路再以该线路 IP 请求 probe_url（期望 HTTP 204），
+# 不通则判定为 nonet（认证在线但外网不通），watchdog 会对其注销后重新登录。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
@@ -174,6 +179,37 @@ fetch() {
 
 strip_jsonp() { echo "$1" | sed -e 's/^[^(]*(//' -e 's/)[^)]*$//'; }
 
+# ── 外网连通检测 ──
+PROBE_URLS_DEFAULT="http://connect.rom.miui.com/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204"
+
+probe_on() { [ "$(cfg probe)" != "0" ]; }
+probe_urls() { local u; u=$(cfg probe_url); echo "${u:-$PROBE_URLS_DEFAULT}"; }
+
+# probe_net [源IP]：依次请求 probe_url，任一返回 HTTP 204 即为通
+# 返回 0 通 / 1 不通 / 2 无法判断（无 curl、DNS 解析失败——不据此重登，避免误判）
+# 只认 204：未认证时校园网会把 HTTP 劫持到认证页（200/302），不能算通
+probe_net() {
+	local u code rc tried=0
+	command -v curl >/dev/null 2>&1 || return 2
+	for u in $(probe_urls); do
+		code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+			${1:+--interface "$1"} "$u" 2>/dev/null)
+		rc=$?
+		[ "$code" = "204" ] && return 0
+		[ "$rc" = "6" ] && continue
+		tried=1
+	done
+	[ "$tried" = "1" ] && return 1
+	return 2
+}
+
+# 隔 3 秒两轮都不通才算不通（过滤瞬时抖动），供 watchdog 判定
+net_down() {
+	probe_net "$1"; [ $? -eq 1 ] || return 1
+	sleep 3
+	probe_net "$1"; [ $? -eq 1 ]
+}
+
 # 向当前 json 对象写入线路查询结果字段
 add_query_fields() {
 	local id="$1" raw json result msg
@@ -197,8 +233,19 @@ add_query_fields() {
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
 	if [ "$result" = "1" ]; then
-		json_add_string status "online"
-		json_add_string msg "${msg:-在线}"
+		local net=""
+		if probe_on; then
+			probe_net "$BIND"
+			case $? in 0) net="ok" ;; 1) net="down" ;; *) net="unknown" ;; esac
+			json_add_string net "$net"
+		fi
+		if [ "$net" = "down" ]; then
+			json_add_string status "nonet"
+			json_add_string msg "认证服务器显示在线，但外网不通（运营商侧会话可能已失效，可点「重新认证」）"
+		else
+			json_add_string status "online"
+			json_add_string msg "${msg:-在线}"
+		fi
 		json_add_string account  "$(jsonfilter -s "$json" -e '@.data.param_account'  2>/dev/null)"
 		json_add_string carrier  "$(jsonfilter -s "$json" -e '@.data.param_exit'     2>/dev/null)"
 		json_add_string duration "$(jsonfilter -s "$json" -e '@.data.param_duration' 2>/dev/null)"
@@ -224,6 +271,15 @@ query_state() {
 	esac
 }
 
+# 含外网检测的状态：online / nonet / offline / error（用于日志）
+line_state() {
+	local st; st=$(query_state "$1")
+	if [ "$st" = "online" ] && probe_on && resolve_bind "$1"; then
+		probe_net "$BIND"; [ $? -eq 1 ] && st="nonet"
+	fi
+	echo "$st"
+}
+
 bad_line() {
 	json_init
 	json_add_int ts "$(date +%s)"
@@ -241,18 +297,27 @@ cmd_query() {
 	json_dump
 }
 
+# 各线路并行查询（每条含认证查询 + 外网检测，串行时多条线路异常会叠加超时）
 cmd_status() {
-	local id
-	json_init
-	json_add_int ts "$(date +%s)"
-	json_add_array lines
+	local id tmp n=0 sep="" out
+	tmp=$(mktemp -d /tmp/zzucna.XXXXXX) || tmp="/tmp/zzucna.$$"
+	mkdir -p "$tmp"
 	for id in $(line_ids); do
-		json_add_object ""
-		add_query_fields "$id"
-		json_close_object
+		n=$((n + 1))
+		echo "$id" > "$tmp/$n.id"
+		( json_init; add_query_fields "$id"; json_dump > "$tmp/$n.json" ) &
 	done
-	json_close_array
-	json_dump
+	wait
+	out="{ \"ts\": $(date +%s), \"lines\": [ "
+	id=1
+	while [ "$id" -le "$n" ]; do
+		if [ -s "$tmp/$id.json" ]; then
+			out="$out$sep$(cat "$tmp/$id.json")"; sep=", "
+		fi
+		id=$((id + 1))
+	done
+	rm -rf "$tmp"
+	echo "$out ] }"
 }
 
 cmd_login() {
@@ -314,7 +379,20 @@ reauth_one() {
 		sleep 1
 	fi
 	cmd_login "$id" >/dev/null 2>&1
-	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(query_state "$id"))"
+	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(line_state "$id"))"
+}
+
+# 页面「重新认证」：注销（若在线）→ 隔 1s → 登录，输出登录结果 JSON
+cmd_relogin() {
+	local id="$1"
+	line_exists "$id" || { bad_line "$id"; return; }
+	exec 9>"$LOCK"; lock_fd
+	if [ "$(query_state "$id")" = "online" ]; then
+		cmd_logout "$id" >/dev/null 2>&1
+		sleep 1
+	fi
+	logger -t "$TAG" "manual re-auth [$id]"
+	cmd_login "$id"
 }
 
 cmd_reauth() {
@@ -328,15 +406,27 @@ cmd_reauth() {
 	fi
 }
 
-# 离线（认证服务器可达但未登录）→ 自动登录；服务器不可达则不动作
+# 离线（认证服务器可达但未登录）→ 自动登录；
+# 认证在线但外网不通（运营商侧会话失效）→ 注销后重新登录；
+# 认证服务器不可达 / 外网无法判断 → 不动作
 cmd_watchdog() {
 	local id st
 	exec 9>"$LOCK"; lock_fd
 	for id in $(line_ids); do
 		st=$(query_state "$id")
-		[ "$st" = "offline" ] || continue
-		cmd_login "$id" >/dev/null 2>&1
-		logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(query_state "$id")"
+		case "$st" in
+		offline)
+			cmd_login "$id" >/dev/null 2>&1
+			logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(line_state "$id")"
+			;;
+		online)
+			probe_on || continue
+			resolve_bind "$id" || continue
+			net_down "$BIND" || continue
+			logger -t "$TAG" "watchdog: [$id] portal online but internet unreachable, re-auth"
+			reauth_one "$id"
+			;;
+		esac
 	done
 }
 
@@ -360,6 +450,7 @@ case "$1" in
 	login)    cmd_login  "$line" ;;
 	logout)   cmd_logout "$line" ;;
 	reauth)   cmd_reauth "$2" ;;
+	relogin)  cmd_relogin "$line" ;;
 	watchdog) cmd_watchdog ;;
-	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog|migrate}" >&2; exit 1 ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|relogin [line]|watchdog|migrate}" >&2; exit 1 ;;
 esac

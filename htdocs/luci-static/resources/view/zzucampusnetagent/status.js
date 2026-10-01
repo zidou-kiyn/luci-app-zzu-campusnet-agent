@@ -10,6 +10,7 @@
 var callStatus = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'status', expect: { } });
 var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  params: [ 'line' ], expect: { } });
 var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', params: [ 'line' ], expect: { } });
+var callReauth = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'reauth', params: [ 'line' ], expect: { } });
 
 // 颜色全部收敛为 --zzu-* 变量；暗色由 prefers-color-scheme 或 .zzu-dark 触发，.zzu-light 可强制亮色
 var DARK_VARS = '--zzu-pt:#a3aeff;--zzu-ok:#2fc98c;--zzu-warn:#f5ad55;--zzu-err:#f07892;--zzu-et:#f497ab;--zzu-bg:#282838;--zzu-bg2:#21212f;--zzu-tx:#e8ebf3;--zzu-tx2:#bfc3d6;--zzu-mu:#9ca2ba;--zzu-bd:rgba(255,255,255,.08);--zzu-bd2:rgba(255,255,255,.15);--zzu-in:#2f2f43;--zzu-sk:rgba(255,255,255,.09);--zzu-sh:0 8px 24px rgba(0,0,0,.32);--zzu-sh2:0 16px 36px rgba(0,0,0,.45)';
@@ -29,6 +30,7 @@ var STYLE = `
 .zzu-line:last-child{margin-bottom:0}
 .zzu-line.is-online{--zzu-c:#0b7470;--zzu-g:linear-gradient(135deg,#0d8058,#0b7470)}
 .zzu-line.is-offline{--zzu-c:#a3421a;--zzu-g:linear-gradient(135deg,#b0560c,#a3421a)}
+.zzu-line.is-nonet{--zzu-c:#8a4b08;--zzu-g:linear-gradient(135deg,#9a6206,#8a4b08)}
 /* 横幅 */
 .zzu-banner{position:relative;border-radius:16px;padding:22px 24px 58px;color:#fff;background:radial-gradient(circle at 100% 0,rgba(255,255,255,.16),transparent 55%),var(--zzu-g);box-shadow:0 14px 30px -12px var(--zzu-c)}
 .zzu-banner-in{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
@@ -76,8 +78,8 @@ var STYLE = `
 .zzu-stat-ico .zzu-i{width:19px;height:19px}
 .zzu-stat-k{font-size:12px;color:var(--zzu-mu);white-space:nowrap}
 .zzu-stat-v{margin-top:3px;font-size:14.5px;font-weight:700;font-variant-numeric:tabular-nums;word-break:break-all}
-.zzu-line:not(.is-online) .zzu-stat-ico{color:var(--zzu-mu);opacity:.6}
-.zzu-line:not(.is-online) .zzu-stat-v{width:62%;height:10px;margin-top:7px;border-radius:5px;background:var(--zzu-sk);color:transparent;overflow:hidden}
+.zzu-line:not(.is-online):not(.is-nonet) .zzu-stat-ico{color:var(--zzu-mu);opacity:.6}
+.zzu-line:not(.is-online):not(.is-nonet) .zzu-stat-v{width:62%;height:10px;margin-top:7px;border-radius:5px;background:var(--zzu-sk);color:transparent;overflow:hidden}
 .zzu-copy{cursor:copy;text-decoration:underline dashed transparent;text-underline-offset:3px;transition:text-decoration-color .15s}
 .zzu-copy:hover{text-decoration-color:var(--zzu-mu)}
 .zzu-copy.copied::after{content:" 已复制";font-size:11px;color:var(--zzu-ok)}
@@ -88,6 +90,7 @@ var STYLE = `
 .zzu-chip::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--zzu-err)}
 .zzu-chip.is-online::before{background:var(--zzu-ok)}
 .zzu-chip.is-offline::before{background:var(--zzu-warn)}
+.zzu-chip.is-nonet::before{background:#d9480f}
 .zzu-sum-t{margin-left:auto;display:inline-flex;align-items:center;gap:6px;color:var(--zzu-mu);font-variant-numeric:tabular-nums}
 .zzu-sum-t .zzu-ring{color:var(--zzu-pri)}
 .zzu-multi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
@@ -203,6 +206,7 @@ var RING = '<svg class="zzu-ring" viewBox="0 0 20 20" aria-hidden="true"><circle
 
 var META = {
     online:  { label: '在线',     icon: 'check', pulse: true },
+    nonet:   { label: '外网不通', icon: 'wifiOff' },
     offline: { label: '离线',     icon: 'wifiOff' },
     error:   { label: '连接异常', icon: 'alert' }
 };
@@ -285,6 +289,16 @@ return view.extend({
         }).catch(function() { self.showMsg(false, '登录请求异常'); });
     },
 
+    // 认证在线但外网不通：后端先注销再登录
+    handleReauth: function(line) {
+        var self = this;
+        return callReauth(line).then(function(r) {
+            r = r || {};
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '重新认证成功：' : '重新认证未成功：') + fmt(r.msg));
+            return self.refresh();
+        }).catch(function() { self.showMsg(false, '重新认证请求异常'); });
+    },
+
     handleLogout: function(line) {
         var self = this;
         return callLogout(line).then(function(r) {
@@ -344,11 +358,12 @@ return view.extend({
 
     // 多线路汇总条：线路数 / 各状态计数 / 最近更新 + 刷新倒计时环
     renderSum: function(lines, tsv) {
-        var c = { online: 0, offline: 0, error: 0 };
+        var c = { online: 0, nonet: 0, offline: 0, error: 0 };
         lines.forEach(function(l) { c[stKey(l.status)]++; });
         return E('div', { 'class': 'zzu-sum' }, [
             E('b', {}, [ lines.length + ' 条线路' ]),
             E('span', { 'class': 'zzu-chip is-online' },  [ c.online + ' 在线' ]),
+            c.nonet ? E('span', { 'class': 'zzu-chip is-nonet' }, [ c.nonet + ' 外网不通' ]) : '',
             E('span', { 'class': 'zzu-chip is-offline' }, [ c.offline + ' 离线' ]),
             E('span', { 'class': 'zzu-chip is-error' },   [ c.error + ' 异常' ]),
             E('span', { 'class': 'zzu-sum-t', 'title': '每 10 秒自动刷新' }, [ ring(), '最近更新 ' + hms(tsv) ])
@@ -360,7 +375,8 @@ return view.extend({
     renderLine: function(res, tsv, multi) {
         var self = this;
         res = res || {};
-        var st = stKey(res.status), m = META[st], on = st === 'online';
+        // nonet 仍有认证信息（账号/时长等），统计卡照常显示
+        var st = stKey(res.status), m = META[st], on = st === 'online' || st === 'nonet';
         var id = res.id || '';
         var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
@@ -391,7 +407,9 @@ return view.extend({
                     btn('refresh', 'refresh', '刷新', 'handleRefresh')
                 ] : [
                     btn('refresh', 'refresh', '刷新', 'handleRefresh'),
-                    btn('login',   'login',   '登录', 'handleLogin'),
+                    st === 'nonet'
+                        ? btn('login', 'refresh', '重新认证', 'handleReauth')
+                        : btn('login', 'login',   '登录', 'handleLogin'),
                     btn('logout',  'power',   '注销', 'handleLogout')
                 ])
             ])
@@ -450,7 +468,7 @@ return view.extend({
         o.depends('auto_relogin', '1');
 
         o = s.option(form.Flag, 'watchdog', '掉线自动重登',
-            '定期检查所有线路，发现未登录（认证服务器可达但离线）时自动重新登录');
+            '定期检查所有线路：未登录时自动登录；开启外网检测时，认证在线但外网不通也会自动注销后重新登录');
         o.default = '0';
         o.rmempty = false;
 
@@ -459,6 +477,16 @@ return view.extend({
         o.placeholder = '5';
         o.default = '5';
         o.depends('watchdog', '1');
+
+        o = s.option(form.Flag, 'probe', '外网连通检测',
+            '认证服务器只记录登录状态，运营商侧会话失效后仍会显示在线。开启后对在线的线路再以该线路 IP 访问检测地址，不通则显示“外网不通”（需要 curl）');
+        o.default = '1';
+        o.rmempty = false;
+
+        o = s.option(form.DynamicList, 'probe_url', '检测地址',
+            '须返回 HTTP 204（任一通即算通）。留空使用默认：connect.rom.miui.com / connectivitycheck.platform.hicloud.com 的 /generate_204');
+        o.placeholder = 'http://connect.rom.miui.com/generate_204';
+        o.depends('probe', '1');
 
         // 认证线路：每行一条，以所选出口接口的 IP 向认证服务器登录（排在前面的先显示）
         var ls = m.section(form.TableSection, 'line', '认证线路',

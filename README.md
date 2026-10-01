@@ -7,6 +7,7 @@
 - ⏰ **每天定时重新授权**：到点若在线则先注销、隔 1 秒再登录，保证授权不掉线（默认凌晨 06:00）
 - 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信1 + 移动1），每条线路独立显示状态、独立登录/注销
 - 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
+- 🌐 **外网连通检测**（默认开启）：认证服务器只记录登录状态，运营商侧会话失效后仍显示“在线”。插件对在线线路再以该线路 IP 访问 `generate_204` 检测地址，不通则显示 **外网不通**（可一键「重新认证」）；看门狗隔 3 秒复测仍不通则自动“注销→登录”
 - ⚙ **UI 内可改**：服务器地址 baseurl、定时开关与时间；「认证线路」表格里每行一条线路（名称、账号、密码、出口接口、运营商 移动/联通/电信/校园网/学科专网）
 - 🎨 Argon Design 配色卡片风，贴近 argon 主题
 
@@ -278,13 +279,15 @@ zzucampusnetagent query [线路]    # 单条线路状态（线路用 UCI 段名�
 zzucampusnetagent login [线路]    # 用已保存配置登录
 zzucampusnetagent logout [线路]   # 注销
 zzucampusnetagent reauth [线路]   # “注销→隔1s→登录”；不带参数 = 全部线路
-zzucampusnetagent watchdog        # 检查全部线路，离线的自动重登
+zzucampusnetagent relogin [线路]  # 同上（单条），输出登录结果 JSON（页面「重新认证」按钮调用）
+zzucampusnetagent watchdog        # 检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登
 zzucampusnetagent migrate         # 手动触发旧版配置迁移（平时每次调用都会自动检查）
 logread | grep zzucampusnetagent    # 看定时重授权日志
 crontab -l                  # 确认定时任务已写入（# zzucampusnetagent-reauth / -watchdog）
 ```
 
 - `query` 能返回 `"status":"online"` 说明后端正常；页面看不到就 Ctrl+F5 强刷。
+- `"status":"nonet"`（`"net":"down"`）= 认证服务器显示在线但该线路外网不通，常见于同一账号同一运营商在多个出口反复注销/登录后运营商侧会话失效；`reauth` 该线路即可恢复。检测地址可用 `uci add_list zzucampusnetagent.config.probe_url=...` 自定义（须返回 HTTP 204），`uci set zzucampusnetagent.config.probe=0` 关闭检测。
 - 登录返回 `result:0` 且提示账号密码为空 → 先在 UI 填好并【保存并应用】。
 - 登录一直失败 → 核对运营商后缀是否选对、密码是否正确、baseurl 是否正确。
 - `crontab -l` 没有任务 → 确认已勾选“每天定时重新授权”并点过【保存并应用】。

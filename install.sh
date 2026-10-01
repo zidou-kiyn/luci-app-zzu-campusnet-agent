@@ -66,6 +66,7 @@ cat > "$JS_DIR/status.js" <<'ZZU_EOF_JS'
 var callStatus = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'status', expect: { } });
 var callLogin  = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'login',  params: [ 'line' ], expect: { } });
 var callLogout = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'logout', params: [ 'line' ], expect: { } });
+var callReauth = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'reauth', params: [ 'line' ], expect: { } });
 
 // 颜色全部收敛为 --zzu-* 变量；暗色由 prefers-color-scheme 或 .zzu-dark 触发，.zzu-light 可强制亮色
 var DARK_VARS = '--zzu-pt:#a3aeff;--zzu-ok:#2fc98c;--zzu-warn:#f5ad55;--zzu-err:#f07892;--zzu-et:#f497ab;--zzu-bg:#282838;--zzu-bg2:#21212f;--zzu-tx:#e8ebf3;--zzu-tx2:#bfc3d6;--zzu-mu:#9ca2ba;--zzu-bd:rgba(255,255,255,.08);--zzu-bd2:rgba(255,255,255,.15);--zzu-in:#2f2f43;--zzu-sk:rgba(255,255,255,.09);--zzu-sh:0 8px 24px rgba(0,0,0,.32);--zzu-sh2:0 16px 36px rgba(0,0,0,.45)';
@@ -85,6 +86,7 @@ var STYLE = `
 .zzu-line:last-child{margin-bottom:0}
 .zzu-line.is-online{--zzu-c:#0b7470;--zzu-g:linear-gradient(135deg,#0d8058,#0b7470)}
 .zzu-line.is-offline{--zzu-c:#a3421a;--zzu-g:linear-gradient(135deg,#b0560c,#a3421a)}
+.zzu-line.is-nonet{--zzu-c:#8a4b08;--zzu-g:linear-gradient(135deg,#9a6206,#8a4b08)}
 /* 横幅 */
 .zzu-banner{position:relative;border-radius:16px;padding:22px 24px 58px;color:#fff;background:radial-gradient(circle at 100% 0,rgba(255,255,255,.16),transparent 55%),var(--zzu-g);box-shadow:0 14px 30px -12px var(--zzu-c)}
 .zzu-banner-in{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
@@ -132,8 +134,8 @@ var STYLE = `
 .zzu-stat-ico .zzu-i{width:19px;height:19px}
 .zzu-stat-k{font-size:12px;color:var(--zzu-mu);white-space:nowrap}
 .zzu-stat-v{margin-top:3px;font-size:14.5px;font-weight:700;font-variant-numeric:tabular-nums;word-break:break-all}
-.zzu-line:not(.is-online) .zzu-stat-ico{color:var(--zzu-mu);opacity:.6}
-.zzu-line:not(.is-online) .zzu-stat-v{width:62%;height:10px;margin-top:7px;border-radius:5px;background:var(--zzu-sk);color:transparent;overflow:hidden}
+.zzu-line:not(.is-online):not(.is-nonet) .zzu-stat-ico{color:var(--zzu-mu);opacity:.6}
+.zzu-line:not(.is-online):not(.is-nonet) .zzu-stat-v{width:62%;height:10px;margin-top:7px;border-radius:5px;background:var(--zzu-sk);color:transparent;overflow:hidden}
 .zzu-copy{cursor:copy;text-decoration:underline dashed transparent;text-underline-offset:3px;transition:text-decoration-color .15s}
 .zzu-copy:hover{text-decoration-color:var(--zzu-mu)}
 .zzu-copy.copied::after{content:" 已复制";font-size:11px;color:var(--zzu-ok)}
@@ -144,6 +146,7 @@ var STYLE = `
 .zzu-chip::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--zzu-err)}
 .zzu-chip.is-online::before{background:var(--zzu-ok)}
 .zzu-chip.is-offline::before{background:var(--zzu-warn)}
+.zzu-chip.is-nonet::before{background:#d9480f}
 .zzu-sum-t{margin-left:auto;display:inline-flex;align-items:center;gap:6px;color:var(--zzu-mu);font-variant-numeric:tabular-nums}
 .zzu-sum-t .zzu-ring{color:var(--zzu-pri)}
 .zzu-multi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
@@ -259,6 +262,7 @@ var RING = '<svg class="zzu-ring" viewBox="0 0 20 20" aria-hidden="true"><circle
 
 var META = {
     online:  { label: '在线',     icon: 'check', pulse: true },
+    nonet:   { label: '外网不通', icon: 'wifiOff' },
     offline: { label: '离线',     icon: 'wifiOff' },
     error:   { label: '连接异常', icon: 'alert' }
 };
@@ -341,6 +345,16 @@ return view.extend({
         }).catch(function() { self.showMsg(false, '登录请求异常'); });
     },
 
+    // 认证在线但外网不通：后端先注销再登录
+    handleReauth: function(line) {
+        var self = this;
+        return callReauth(line).then(function(r) {
+            r = r || {};
+            self.showMsg(r.result == 1, '[' + self.lineName(line) + '] ' + (r.result == 1 ? '重新认证成功：' : '重新认证未成功：') + fmt(r.msg));
+            return self.refresh();
+        }).catch(function() { self.showMsg(false, '重新认证请求异常'); });
+    },
+
     handleLogout: function(line) {
         var self = this;
         return callLogout(line).then(function(r) {
@@ -400,11 +414,12 @@ return view.extend({
 
     // 多线路汇总条：线路数 / 各状态计数 / 最近更新 + 刷新倒计时环
     renderSum: function(lines, tsv) {
-        var c = { online: 0, offline: 0, error: 0 };
+        var c = { online: 0, nonet: 0, offline: 0, error: 0 };
         lines.forEach(function(l) { c[stKey(l.status)]++; });
         return E('div', { 'class': 'zzu-sum' }, [
             E('b', {}, [ lines.length + ' 条线路' ]),
             E('span', { 'class': 'zzu-chip is-online' },  [ c.online + ' 在线' ]),
+            c.nonet ? E('span', { 'class': 'zzu-chip is-nonet' }, [ c.nonet + ' 外网不通' ]) : '',
             E('span', { 'class': 'zzu-chip is-offline' }, [ c.offline + ' 离线' ]),
             E('span', { 'class': 'zzu-chip is-error' },   [ c.error + ' 异常' ]),
             E('span', { 'class': 'zzu-sum-t', 'title': '每 10 秒自动刷新' }, [ ring(), '最近更新 ' + hms(tsv) ])
@@ -416,7 +431,8 @@ return view.extend({
     renderLine: function(res, tsv, multi) {
         var self = this;
         res = res || {};
-        var st = stKey(res.status), m = META[st], on = st === 'online';
+        // nonet 仍有认证信息（账号/时长等），统计卡照常显示
+        var st = stKey(res.status), m = META[st], on = st === 'online' || st === 'nonet';
         var id = res.id || '';
         var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
@@ -447,7 +463,9 @@ return view.extend({
                     btn('refresh', 'refresh', '刷新', 'handleRefresh')
                 ] : [
                     btn('refresh', 'refresh', '刷新', 'handleRefresh'),
-                    btn('login',   'login',   '登录', 'handleLogin'),
+                    st === 'nonet'
+                        ? btn('login', 'refresh', '重新认证', 'handleReauth')
+                        : btn('login', 'login',   '登录', 'handleLogin'),
                     btn('logout',  'power',   '注销', 'handleLogout')
                 ])
             ])
@@ -506,7 +524,7 @@ return view.extend({
         o.depends('auto_relogin', '1');
 
         o = s.option(form.Flag, 'watchdog', '掉线自动重登',
-            '定期检查所有线路，发现未登录（认证服务器可达但离线）时自动重新登录');
+            '定期检查所有线路：未登录时自动登录；开启外网检测时，认证在线但外网不通也会自动注销后重新登录');
         o.default = '0';
         o.rmempty = false;
 
@@ -515,6 +533,16 @@ return view.extend({
         o.placeholder = '5';
         o.default = '5';
         o.depends('watchdog', '1');
+
+        o = s.option(form.Flag, 'probe', '外网连通检测',
+            '认证服务器只记录登录状态，运营商侧会话失效后仍会显示在线。开启后对在线的线路再以该线路 IP 访问检测地址，不通则显示“外网不通”（需要 curl）');
+        o.default = '1';
+        o.rmempty = false;
+
+        o = s.option(form.DynamicList, 'probe_url', '检测地址',
+            '须返回 HTTP 204（任一通即算通）。留空使用默认：connect.rom.miui.com / connectivitycheck.platform.hicloud.com 的 /generate_204');
+        o.placeholder = 'http://connect.rom.miui.com/generate_204';
+        o.depends('probe', '1');
 
         // 认证线路：每行一条，以所选出口接口的 IP 向认证服务器登录（排在前面的先显示）
         var ls = m.section(form.TableSection, 'line', '认证线路',
@@ -604,13 +632,18 @@ cat > "$BIN" <<'ZZU_EOF_BIN'
 #   zzucampusnetagent login  [线路]       登录单条线路（默认第一条）
 #   zzucampusnetagent logout [线路]       注销单条线路（默认第一条）
 #   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
-#   zzucampusnetagent watchdog            检查全部线路，离线的自动重新登录
+#   zzucampusnetagent relogin [线路]      同 reauth（单条线路），输出登录结果 JSON（供页面调用）
+#   zzucampusnetagent watchdog            检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登
 #   zzucampusnetagent migrate             把旧版配置迁移为新版（见 migrate()）
 #
 # 线路: UCI 中类型为 line 的段，段名即线路 id（旧版主线路迁移后为 "main"），
 # 每条线路自带 account/password。config 段只存全局设置：服务器地址、定时重授权、掉线检测。
 # 每条线路可绑定一个 netifd 逻辑接口（iface），请求会以该接口的 IP 为源地址发出，
 # 从而让同一账号在不同出口上分别以不同运营商认证；iface 留空则走系统默认路由。
+#
+# 外网检测（config.probe，默认开启）：认证服务器只记录“登录过”，运营商侧会话失效后
+# 仍会返回在线。因此对“在线”的线路再以该线路 IP 请求 probe_url（期望 HTTP 204），
+# 不通则判定为 nonet（认证在线但外网不通），watchdog 会对其注销后重新登录。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
@@ -771,6 +804,37 @@ fetch() {
 
 strip_jsonp() { echo "$1" | sed -e 's/^[^(]*(//' -e 's/)[^)]*$//'; }
 
+# ── 外网连通检测 ──
+PROBE_URLS_DEFAULT="http://connect.rom.miui.com/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204"
+
+probe_on() { [ "$(cfg probe)" != "0" ]; }
+probe_urls() { local u; u=$(cfg probe_url); echo "${u:-$PROBE_URLS_DEFAULT}"; }
+
+# probe_net [源IP]：依次请求 probe_url，任一返回 HTTP 204 即为通
+# 返回 0 通 / 1 不通 / 2 无法判断（无 curl、DNS 解析失败——不据此重登，避免误判）
+# 只认 204：未认证时校园网会把 HTTP 劫持到认证页（200/302），不能算通
+probe_net() {
+	local u code rc tried=0
+	command -v curl >/dev/null 2>&1 || return 2
+	for u in $(probe_urls); do
+		code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+			${1:+--interface "$1"} "$u" 2>/dev/null)
+		rc=$?
+		[ "$code" = "204" ] && return 0
+		[ "$rc" = "6" ] && continue
+		tried=1
+	done
+	[ "$tried" = "1" ] && return 1
+	return 2
+}
+
+# 隔 3 秒两轮都不通才算不通（过滤瞬时抖动），供 watchdog 判定
+net_down() {
+	probe_net "$1"; [ $? -eq 1 ] || return 1
+	sleep 3
+	probe_net "$1"; [ $? -eq 1 ]
+}
+
 # 向当前 json 对象写入线路查询结果字段
 add_query_fields() {
 	local id="$1" raw json result msg
@@ -794,8 +858,19 @@ add_query_fields() {
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
 	if [ "$result" = "1" ]; then
-		json_add_string status "online"
-		json_add_string msg "${msg:-在线}"
+		local net=""
+		if probe_on; then
+			probe_net "$BIND"
+			case $? in 0) net="ok" ;; 1) net="down" ;; *) net="unknown" ;; esac
+			json_add_string net "$net"
+		fi
+		if [ "$net" = "down" ]; then
+			json_add_string status "nonet"
+			json_add_string msg "认证服务器显示在线，但外网不通（运营商侧会话可能已失效，可点「重新认证」）"
+		else
+			json_add_string status "online"
+			json_add_string msg "${msg:-在线}"
+		fi
 		json_add_string account  "$(jsonfilter -s "$json" -e '@.data.param_account'  2>/dev/null)"
 		json_add_string carrier  "$(jsonfilter -s "$json" -e '@.data.param_exit'     2>/dev/null)"
 		json_add_string duration "$(jsonfilter -s "$json" -e '@.data.param_duration' 2>/dev/null)"
@@ -821,6 +896,15 @@ query_state() {
 	esac
 }
 
+# 含外网检测的状态：online / nonet / offline / error（用于日志）
+line_state() {
+	local st; st=$(query_state "$1")
+	if [ "$st" = "online" ] && probe_on && resolve_bind "$1"; then
+		probe_net "$BIND"; [ $? -eq 1 ] && st="nonet"
+	fi
+	echo "$st"
+}
+
 bad_line() {
 	json_init
 	json_add_int ts "$(date +%s)"
@@ -838,18 +922,27 @@ cmd_query() {
 	json_dump
 }
 
+# 各线路并行查询（每条含认证查询 + 外网检测，串行时多条线路异常会叠加超时）
 cmd_status() {
-	local id
-	json_init
-	json_add_int ts "$(date +%s)"
-	json_add_array lines
+	local id tmp n=0 sep="" out
+	tmp=$(mktemp -d /tmp/zzucna.XXXXXX) || tmp="/tmp/zzucna.$$"
+	mkdir -p "$tmp"
 	for id in $(line_ids); do
-		json_add_object ""
-		add_query_fields "$id"
-		json_close_object
+		n=$((n + 1))
+		echo "$id" > "$tmp/$n.id"
+		( json_init; add_query_fields "$id"; json_dump > "$tmp/$n.json" ) &
 	done
-	json_close_array
-	json_dump
+	wait
+	out="{ \"ts\": $(date +%s), \"lines\": [ "
+	id=1
+	while [ "$id" -le "$n" ]; do
+		if [ -s "$tmp/$id.json" ]; then
+			out="$out$sep$(cat "$tmp/$id.json")"; sep=", "
+		fi
+		id=$((id + 1))
+	done
+	rm -rf "$tmp"
+	echo "$out ] }"
 }
 
 cmd_login() {
@@ -911,7 +1004,20 @@ reauth_one() {
 		sleep 1
 	fi
 	cmd_login "$id" >/dev/null 2>&1
-	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(query_state "$id"))"
+	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(line_state "$id"))"
+}
+
+# 页面「重新认证」：注销（若在线）→ 隔 1s → 登录，输出登录结果 JSON
+cmd_relogin() {
+	local id="$1"
+	line_exists "$id" || { bad_line "$id"; return; }
+	exec 9>"$LOCK"; lock_fd
+	if [ "$(query_state "$id")" = "online" ]; then
+		cmd_logout "$id" >/dev/null 2>&1
+		sleep 1
+	fi
+	logger -t "$TAG" "manual re-auth [$id]"
+	cmd_login "$id"
 }
 
 cmd_reauth() {
@@ -925,15 +1031,27 @@ cmd_reauth() {
 	fi
 }
 
-# 离线（认证服务器可达但未登录）→ 自动登录；服务器不可达则不动作
+# 离线（认证服务器可达但未登录）→ 自动登录；
+# 认证在线但外网不通（运营商侧会话失效）→ 注销后重新登录；
+# 认证服务器不可达 / 外网无法判断 → 不动作
 cmd_watchdog() {
 	local id st
 	exec 9>"$LOCK"; lock_fd
 	for id in $(line_ids); do
 		st=$(query_state "$id")
-		[ "$st" = "offline" ] || continue
-		cmd_login "$id" >/dev/null 2>&1
-		logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(query_state "$id")"
+		case "$st" in
+		offline)
+			cmd_login "$id" >/dev/null 2>&1
+			logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(line_state "$id")"
+			;;
+		online)
+			probe_on || continue
+			resolve_bind "$id" || continue
+			net_down "$BIND" || continue
+			logger -t "$TAG" "watchdog: [$id] portal online but internet unreachable, re-auth"
+			reauth_one "$id"
+			;;
+		esac
 	done
 }
 
@@ -957,8 +1075,9 @@ case "$1" in
 	login)    cmd_login  "$line" ;;
 	logout)   cmd_logout "$line" ;;
 	reauth)   cmd_reauth "$2" ;;
+	relogin)  cmd_relogin "$line" ;;
 	watchdog) cmd_watchdog ;;
-	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|watchdog|migrate}" >&2; exit 1 ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|relogin [line]|watchdog|migrate}" >&2; exit 1 ;;
 esac
 ZZU_EOF_BIN
 chmod +x "$BIN"
@@ -969,7 +1088,7 @@ cat > "$RPCD" <<'ZZU_EOF_RPCD'
 BIN="/usr/sbin/zzucampusnetagent"
 case "$1" in
 	list)
-		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" } }'
 		;;
 	call)
 		read -r input 2>/dev/null
@@ -982,6 +1101,7 @@ case "$1" in
 			query)  "$BIN" query  "$line" ;;
 			login)  "$BIN" login  "$line" ;;
 			logout) "$BIN" logout "$line" ;;
+			reauth) "$BIN" relogin "$line" ;;
 			*) echo '{}' ;;
 		esac
 		;;
@@ -1079,7 +1199,7 @@ cat > "$ACL" <<'ZZU_EOF_ACL'
 		},
 		"write": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "login", "logout" ]
+				"luci.zzucampusnetagent": [ "login", "logout", "reauth" ]
 			},
 			"uci": [ "zzucampusnetagent" ]
 		}
@@ -1096,6 +1216,9 @@ config zzucampusnetagent 'config'
 	option relogin_time '06:00'
 	option watchdog '0'
 	option watchdog_interval '5'
+	# 外网检测：认证在线的线路再以该线路 IP 请求 probe_url（须返回 HTTP 204），不通则判定外网不通
+	option probe '1'
+	# list probe_url 'http://connect.rom.miui.com/generate_204'
 
 # 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；
 # iface 留空 = 走系统默认路由（单线路时保持留空即可）；account/password 每条线路各自填写。
