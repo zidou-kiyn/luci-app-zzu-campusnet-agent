@@ -164,6 +164,8 @@ GW=10.172.255.254
 build() {
 	local tbl="$1" NH="" n=0 dev ip; shift
 	for dev in "$@"; do
+		# ifdown 时设备可能还带着 IP，须显式排除；否则多路路由含该设备，设备随后被删除时内核会连同整条路由一起删掉
+		[ "$ACTION" = "ifdown" ] && [ "$dev" = "$DEVICE" -o "$dev" = "$INTERFACE" ] && continue
 		ip link show "$dev" up >/dev/null 2>&1 || continue
 		ip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}')
 		[ -z "$ip" ] && continue
