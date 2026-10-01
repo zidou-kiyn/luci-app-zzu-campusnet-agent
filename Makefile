@@ -12,7 +12,7 @@ LUCI_DEPENDS:=
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-zzu-campusnet-agent
-PKG_VERSION:=1.3.0
+PKG_VERSION:=1.4.0
 PKG_RELEASE:=1
 PKG_MAINTAINER:=luci-app-zzu-campusnet-agent
 PKG_LICENSE:=MIT

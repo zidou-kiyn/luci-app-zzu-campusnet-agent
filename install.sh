@@ -414,12 +414,13 @@ return view.extend({
 
     // 多线路汇总条：线路数 / 各状态计数 / 最近更新 + 刷新倒计时环
     renderSum: function(lines, tsv) {
-        var c = { online: 0, nonet: 0, offline: 0, error: 0 };
-        lines.forEach(function(l) { c[stKey(l.status)]++; });
+        var c = { online: 0, nonet: 0, offline: 0, error: 0, removed: 0 };
+        lines.forEach(function(l) { c[stKey(l.status)]++; if (l.removed) c.removed++; });
         return E('div', { 'class': 'zzu-sum' }, [
             E('b', {}, [ lines.length + ' 条线路' ]),
             E('span', { 'class': 'zzu-chip is-online' },  [ c.online + ' 在线' ]),
             c.nonet ? E('span', { 'class': 'zzu-chip is-nonet' }, [ c.nonet + ' 外网不通' ]) : '',
+            c.removed ? E('span', { 'class': 'zzu-chip is-nonet', 'title': '外网不通，已从多路聚合中摘除；连续 2 次检测正常后自动加回' }, [ c.removed + ' 已摘除' ]) : '',
             E('span', { 'class': 'zzu-chip is-offline' }, [ c.offline + ' 离线' ]),
             E('span', { 'class': 'zzu-chip is-error' },   [ c.error + ' 异常' ]),
             E('span', { 'class': 'zzu-sum-t', 'title': '每 10 秒自动刷新' }, [ ring(), '最近更新 ' + hms(tsv) ])
@@ -437,7 +438,7 @@ return view.extend({
         var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
         var pill = multi
-            ? E('span', { 'class': 'zzu-pill' }, [ res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由' ])
+            ? E('span', { 'class': 'zzu-pill' }, [ (res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由') + (res.removed ? ' · 已从聚合摘除' : '') ])
             : E('span', { 'class': 'zzu-pill', 'title': '每 10 秒自动刷新' }, [ ring(), '自动刷新' ]);
 
         var btn = function(role, icon, label, handler) {
@@ -539,6 +540,12 @@ return view.extend({
         o.default = '1';
         o.rmempty = false;
 
+        o = s.option(form.Flag, 'failover', '故障线路自动摘除',
+            '配合多线聚合（extras/99-multipath）：掉线检测发现线路重新认证后仍不通时，把它从聚合路由中暂时去掉，避免新连接分到坏线上打不开；连续 2 次检测正常后自动加回。同组线路全部故障时保留全部。需开启掉线自动重登与外网检测');
+        o.default = '1';
+        o.rmempty = false;
+        o.depends({ watchdog: '1', probe: '1' });
+
         o = s.option(form.DynamicList, 'probe_url', '检测地址',
             '须返回 HTTP 204（任一通即算通）。留空使用默认：connect.rom.miui.com / connectivitycheck.platform.hicloud.com 的 /generate_204');
         o.placeholder = 'http://connect.rom.miui.com/generate_204';
@@ -633,7 +640,8 @@ cat > "$BIN" <<'ZZU_EOF_BIN'
 #   zzucampusnetagent logout [线路]       注销单条线路（默认第一条）
 #   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
 #   zzucampusnetagent relogin [线路]      同 reauth（单条线路），输出登录结果 JSON（供页面调用）
-#   zzucampusnetagent watchdog            检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登
+#   zzucampusnetagent watchdog            检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登；
+#                                         仍不通的线路从多路聚合中摘除，恢复后自动加回
 #   zzucampusnetagent migrate             把旧版配置迁移为新版（见 migrate()）
 #
 # 线路: UCI 中类型为 line 的段，段名即线路 id（旧版主线路迁移后为 "main"），
@@ -644,6 +652,10 @@ cat > "$BIN" <<'ZZU_EOF_BIN'
 # 外网检测（config.probe，默认开启）：认证服务器只记录“登录过”，运营商侧会话失效后
 # 仍会返回在线。因此对“在线”的线路再以该线路 IP 请求 probe_url（期望 HTTP 204），
 # 不通则判定为 nonet（认证在线但外网不通），watchdog 会对其注销后重新登录。
+#
+# 故障摘除（config.failover，默认开启，需外网检测）：watchdog 处理完毕后线路仍不通，
+# 写标记 $DOWN_DIR/<设备名> 并调用 99-multipath 重建组路由（该脚本跳过有标记的设备）。
+# 被摘除的线路仍以自己的源 IP 走自己的路由表，照常检测；连续 FO_RECOVER 次正常后恢复。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
@@ -835,6 +847,80 @@ net_down() {
 	probe_net "$1"; [ $? -eq 1 ]
 }
 
+# ── 故障线路自动摘除（配合 extras/99-multipath）──
+DOWN_DIR="/var/run/zzucampusnetagent/down"
+MP_HOOK="/etc/hotplug.d/iface/99-multipath"
+FO_RECOVER=2
+
+failover_on() { [ "$(cfg failover)" != "0" ] && probe_on; }
+
+# 线路绑定接口对应的三层设备名（接口已下线时退回接口名）；未绑定接口则为空
+fo_dev() {
+	local iface d=""
+	iface=$(lget "$1" iface); [ -n "$iface" ] || return 0
+	network_get_device d "$iface" 2>/dev/null
+	d="${d:-$iface}"
+	case "$d" in *[!A-Za-z0-9_.-]*) return 0 ;; esac
+	echo "$d"
+}
+
+fo_removed() { local d; d=$(fo_dev "$1"); [ -n "$d" ] && [ -f "$DOWN_DIR/$d" ]; }
+
+# 触发多路热插拔脚本重建该设备所在组的路由（未安装则只留标记）
+mp_rebuild() {
+	[ -f "$MP_HOOK" ] && ACTION=ifup INTERFACE="$1" DEVICE="$1" sh "$MP_HOOK" >/dev/null 2>&1
+	return 0
+}
+
+# 线路外网健康：0 通 / 1 不通（隔 3 秒两轮都不通）/ 2 无法判断（含接口无 IP：多路脚本本就不会收录）
+line_health() {
+	local r
+	resolve_bind "$1" || return 2
+	probe_net "$BIND"; r=$?
+	[ $r -eq 1 ] || return $r
+	sleep 3
+	probe_net "$BIND"
+}
+
+# 摘除（已摘除则清零恢复计数）
+fo_mark() {
+	local d; d=$(fo_dev "$1"); [ -n "$d" ] || return 0
+	mkdir -p "$DOWN_DIR"
+	if [ -f "$DOWN_DIR/$d" ]; then echo "$1 0" > "$DOWN_DIR/$d"; return 0; fi
+	echo "$1 0" > "$DOWN_DIR/$d"
+	logger -t "$TAG" "failover: [$1] $d removed from multipath (internet unreachable)"
+	mp_rebuild "$d"
+}
+
+# 正常一次：已摘除的线路连续 FO_RECOVER 次正常才加回（防抖动反复切换）
+fo_ok() {
+	local d n
+	d=$(fo_dev "$1"); [ -n "$d" ] && [ -f "$DOWN_DIR/$d" ] || return 0
+	n=$(awk '{print $2+0}' "$DOWN_DIR/$d" 2>/dev/null); n=$((${n:-0} + 1))
+	if [ "$n" -lt "$FO_RECOVER" ]; then echo "$1 $n" > "$DOWN_DIR/$d"; return 0; fi
+	rm -f "$DOWN_DIR/$d"
+	logger -t "$TAG" "failover: [$1] $d restored to multipath"
+	mp_rebuild "$d"
+}
+
+# 清理失效标记：功能已关闭、线路已删除/禁用、线路换了接口
+fo_gc() {
+	local f id d
+	[ -d "$DOWN_DIR" ] || return 0
+	for f in "$DOWN_DIR"/*; do
+		[ -f "$f" ] || continue
+		d="${f##*/}"; id=""
+		read -r id _ < "$f"
+		if failover_on && line_exists "$id" && [ "$(lget "$id" enabled)" != "0" ] &&
+		   [ "$(fo_dev "$id")" = "$d" ]; then
+			continue
+		fi
+		rm -f "$f"
+		logger -t "$TAG" "failover: stale marker for $d cleared"
+		mp_rebuild "$d"
+	done
+}
+
 # 向当前 json 对象写入线路查询结果字段
 add_query_fields() {
 	local id="$1" raw json result msg
@@ -842,6 +928,7 @@ add_query_fields() {
 	json_add_string name  "$(line_name "$id")"
 	json_add_string iface "$(lget "$id" iface)"
 	json_add_string isp   "$(lget "$id" isp)"
+	fo_removed "$id" && json_add_boolean removed 1
 	if ! resolve_bind "$id"; then
 		json_add_string status "error"
 		json_add_string msg "$ERR"
@@ -1033,10 +1120,12 @@ cmd_reauth() {
 
 # 离线（认证服务器可达但未登录）→ 自动登录；
 # 认证在线但外网不通（运营商侧会话失效）→ 注销后重新登录；
-# 认证服务器不可达 / 外网无法判断 → 不动作
+# 认证服务器不可达 / 外网无法判断 → 不动作；
+# 处理完后再按外网健康决定是否从多路聚合中摘除 / 加回
 cmd_watchdog() {
 	local id st
 	exec 9>"$LOCK"; lock_fd
+	fo_gc
 	for id in $(line_ids); do
 		st=$(query_state "$id")
 		case "$st" in
@@ -1045,13 +1134,16 @@ cmd_watchdog() {
 			logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(line_state "$id")"
 			;;
 		online)
-			probe_on || continue
-			resolve_bind "$id" || continue
-			net_down "$BIND" || continue
-			logger -t "$TAG" "watchdog: [$id] portal online but internet unreachable, re-auth"
-			reauth_one "$id"
+			if probe_on && resolve_bind "$id" && net_down "$BIND"; then
+				logger -t "$TAG" "watchdog: [$id] portal online but internet unreachable, re-auth"
+				reauth_one "$id"
+			fi
 			;;
 		esac
+		failover_on || continue
+		[ -n "$(lget "$id" iface)" ] || continue
+		line_health "$id"
+		case $? in 0) fo_ok "$id" ;; 1) fo_mark "$id" ;; esac
 	done
 }
 
@@ -1218,6 +1310,8 @@ config zzucampusnetagent 'config'
 	option watchdog_interval '5'
 	# 外网检测：认证在线的线路再以该线路 IP 请求 probe_url（须返回 HTTP 204），不通则判定外网不通
 	option probe '1'
+	# 故障线路自动摘除（配合 extras/99-multipath）：重登后仍不通的线路暂时移出多路聚合，恢复后加回
+	option failover '1'
 	# list probe_url 'http://connect.rom.miui.com/generate_204'
 
 # 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；

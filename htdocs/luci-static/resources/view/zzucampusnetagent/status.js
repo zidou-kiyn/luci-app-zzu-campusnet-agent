@@ -358,12 +358,13 @@ return view.extend({
 
     // 多线路汇总条：线路数 / 各状态计数 / 最近更新 + 刷新倒计时环
     renderSum: function(lines, tsv) {
-        var c = { online: 0, nonet: 0, offline: 0, error: 0 };
-        lines.forEach(function(l) { c[stKey(l.status)]++; });
+        var c = { online: 0, nonet: 0, offline: 0, error: 0, removed: 0 };
+        lines.forEach(function(l) { c[stKey(l.status)]++; if (l.removed) c.removed++; });
         return E('div', { 'class': 'zzu-sum' }, [
             E('b', {}, [ lines.length + ' 条线路' ]),
             E('span', { 'class': 'zzu-chip is-online' },  [ c.online + ' 在线' ]),
             c.nonet ? E('span', { 'class': 'zzu-chip is-nonet' }, [ c.nonet + ' 外网不通' ]) : '',
+            c.removed ? E('span', { 'class': 'zzu-chip is-nonet', 'title': '外网不通，已从多路聚合中摘除；连续 2 次检测正常后自动加回' }, [ c.removed + ' 已摘除' ]) : '',
             E('span', { 'class': 'zzu-chip is-offline' }, [ c.offline + ' 离线' ]),
             E('span', { 'class': 'zzu-chip is-error' },   [ c.error + ' 异常' ]),
             E('span', { 'class': 'zzu-sum-t', 'title': '每 10 秒自动刷新' }, [ ring(), '最近更新 ' + hms(tsv) ])
@@ -381,7 +382,7 @@ return view.extend({
         var title = multi ? (fmt(res.name) + ' · ' + m.label) : m.label;
 
         var pill = multi
-            ? E('span', { 'class': 'zzu-pill' }, [ res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由' ])
+            ? E('span', { 'class': 'zzu-pill' }, [ (res.iface ? ('接口 ' + res.iface + (res.bind ? ' · ' + res.bind : '')) : '默认路由') + (res.removed ? ' · 已从聚合摘除' : '') ])
             : E('span', { 'class': 'zzu-pill', 'title': '每 10 秒自动刷新' }, [ ring(), '自动刷新' ]);
 
         var btn = function(role, icon, label, handler) {
@@ -482,6 +483,12 @@ return view.extend({
             '认证服务器只记录登录状态，运营商侧会话失效后仍会显示在线。开启后对在线的线路再以该线路 IP 访问检测地址，不通则显示“外网不通”（需要 curl）');
         o.default = '1';
         o.rmempty = false;
+
+        o = s.option(form.Flag, 'failover', '故障线路自动摘除',
+            '配合多线聚合（extras/99-multipath）：掉线检测发现线路重新认证后仍不通时，把它从聚合路由中暂时去掉，避免新连接分到坏线上打不开；连续 2 次检测正常后自动加回。同组线路全部故障时保留全部。需开启掉线自动重登与外网检测');
+        o.default = '1';
+        o.rmempty = false;
+        o.depends({ watchdog: '1', probe: '1' });
 
         o = s.option(form.DynamicList, 'probe_url', '检测地址',
             '须返回 HTTP 204（任一通即算通）。留空使用默认：connect.rom.miui.com / connectivitycheck.platform.hicloud.com 的 /generate_204');

@@ -157,24 +157,34 @@ cat > /etc/hotplug.d/iface/99-multipath << 'HOTPLUG_EOF'
 #   电信组 → main  表：wanct1 + wanct2
 #   移动组 → wancm 表：wancm1 + wancm2
 # 各线网关同为校园网网关，组表内没有直连路由，因此 nexthop 用 onlink。
+# 故障摘除：认证插件 watchdog 判定线路外网不通时写 $DOWN/<设备名> 并以 ACTION=ifup 调用本脚本，
+# 有标记的设备不进组路由；组内全部被标记时仍保留全部（有默认路由总比没有好）。
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
 
 GW=10.172.255.254
+DOWN=/var/run/zzucampusnetagent/down
 
 build() {
-	local tbl="$1" NH="" n=0 dev ip; shift
+	local tbl="$1" NH="" ALL="" n=0 m=0 x=0 dev ip hop note=""; shift
 	for dev in "$@"; do
 		# ifdown 时设备可能还带着 IP，须显式排除；否则多路路由含该设备，设备随后被删除时内核会连同整条路由一起删掉
 		[ "$ACTION" = "ifdown" ] && [ "$dev" = "$DEVICE" -o "$dev" = "$INTERFACE" ] && continue
 		ip link show "$dev" up >/dev/null 2>&1 || continue
 		ip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}')
 		[ -z "$ip" ] && continue
-		NH="$NH nexthop via $GW dev $dev weight 1 onlink"
-		n=$((n + 1))
+		hop="nexthop via $GW dev $dev weight 1 onlink"
+		ALL="$ALL $hop"; m=$((m + 1))
+		if [ -e "$DOWN/$dev" ]; then x=$((x + 1)); continue; fi
+		NH="$NH $hop"; n=$((n + 1))
 	done
+	if [ "$n" -eq 0 ] && [ "$m" -gt 0 ]; then
+		NH="$ALL"; n=$m; note=" (all marked down, keep all)"
+	elif [ "$x" -gt 0 ]; then
+		note=", $x removed by failover"
+	fi
 	while ip route del default table "$tbl" 2>/dev/null; do :; done
 	[ "$n" -gt 0 ] && ip route add default table "$tbl" $NH
-	logger -t multipath "$tbl: $n path(s)"
+	logger -t multipath "$tbl: $n path(s)$note"
 }
 
 case "$INTERFACE" in
