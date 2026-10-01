@@ -37,7 +37,9 @@ fi
 # 否则前端 RPC 调用会报 -32000 Object not found;此处不依赖 git 是否保留 mode。
 chmod 0755 "package/$PKG_NAME/root/usr/libexec/rpcd/luci.zzucampusnetagent" \
            "package/$PKG_NAME/root/usr/sbin/zzucampusnetagent" \
-           "package/$PKG_NAME/root/etc/init.d/zzucampusnetagent"
+           "package/$PKG_NAME/root/etc/init.d/zzucampusnetagent" \
+           "package/$PKG_NAME/root/usr/sbin/zzunetmon" \
+           "package/$PKG_NAME/root/etc/init.d/zzunetmon"
 
 # luci.mk 与 luci-base 依赖来自 luci feed
 ./scripts/feeds update luci

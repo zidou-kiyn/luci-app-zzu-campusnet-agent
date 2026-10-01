@@ -14,6 +14,10 @@ INITD="/etc/init.d/zzucampusnetagent"
 MENU="/usr/share/luci/menu.d/luci-app-zzu-campusnet-agent.json"
 ACL="/usr/share/rpcd/acl.d/luci-app-zzu-campusnet-agent.json"
 CFG="/etc/config/zzucampusnetagent"
+# 设备监控（流量统计 + DNS 访问记录）
+NETMON_BIN="/usr/sbin/zzunetmon"
+NETMON_INITD="/etc/init.d/zzunetmon"
+NETMON_HOTPLUG="/etc/hotplug.d/iface/90-zzunetmon"
 
 # 旧版本遗留文件（旧包名 luci-app-zzustatus / 旧内部名 zzustatus），升级时清理并迁移配置
 OLD_MENU="/usr/share/luci/menu.d/luci-app-zzustatus.json"
@@ -26,8 +30,11 @@ OLD_CFG="/etc/config/zzustatus"
 
 if [ "$1" = "uninstall" ]; then
 	echo "==> 卸载 luci-app-zzu-campusnet-agent ..."
+	[ -x "$NETMON_INITD" ] && { "$NETMON_INITD" stop 2>/dev/null || true; "$NETMON_INITD" disable 2>/dev/null || true; }
 	[ -x "$INITD" ] && { "$INITD" stop 2>/dev/null || true; "$INITD" disable 2>/dev/null || true; }
 	rm -rf "$JS_DIR" "$OLD_JS_DIR"
+	rm -f "$NETMON_BIN" "$NETMON_INITD" "$NETMON_HOTPLUG"
+	rm -rf /etc/zzunetmon /tmp/zzunetmon
 	rm -f "$RPCD" "$BIN" "$INITD" "$MENU" "$ACL" "$CFG" "$OLD_MENU" "$OLD_ACL" "$OLD_RPCD" "$OLD_BIN" "$OLD_INITD" "$OLD_CFG"
 	[ -f /etc/crontabs/root ] && sed -i -e '\|zzucampusnetagent-reauth|d' -e '\|zzucampusnetagent-watchdog|d' -e '\|zzustatus-reauth|d' /etc/crontabs/root 2>/dev/null || true
 	/etc/init.d/cron restart 2>/dev/null || true
@@ -39,7 +46,7 @@ if [ "$1" = "uninstall" ]; then
 fi
 
 echo "==> 安装/更新 luci-app-zzu-campusnet-agent ..."
-mkdir -p "$JS_DIR" /usr/libexec/rpcd /usr/sbin /etc/init.d /usr/share/luci/menu.d /usr/share/rpcd/acl.d /etc/config
+mkdir -p "$JS_DIR" /usr/libexec/rpcd /usr/sbin /etc/init.d /etc/hotplug.d/iface /usr/share/luci/menu.d /usr/share/rpcd/acl.d /etc/config
 # 清理旧版本（zzustatus）遗留文件：程序、菜单、ACL、cron 任务
 [ -x "$OLD_INITD" ] && { "$OLD_INITD" stop 2>/dev/null || true; "$OLD_INITD" disable 2>/dev/null || true; } || true
 rm -f "$OLD_MENU" "$OLD_ACL" "$OLD_RPCD" "$OLD_BIN" "$OLD_INITD"
@@ -628,6 +635,319 @@ return view.extend({
 });
 ZZU_EOF_JS
 
+cat > "$JS_DIR/netmon.js" <<'ZZU_EOF_JS_NETMON'
+'use strict';
+'require view';
+'require form';
+'require rpc';
+'require poll';
+'require dom';
+'require ui';
+'require uci';
+'require tools.widgets as widgets';
+
+var callDays    = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'netmon_days', expect: { } });
+var callDevices = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'netmon_devices', params: [ 'day' ], expect: { } });
+var callDomains = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'netmon_domains', params: [ 'id', 'day' ], expect: { } });
+var callAlias   = rpc.declare({ object: 'luci.zzucampusnetagent', method: 'netmon_alias', params: [ 'id', 'name' ], expect: { } });
+
+var STYLE = `
+.zzm{max-width:1100px}
+.zzm-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px;margin:6px 0 14px}
+.zzm-bar select{min-width:190px}
+.zzm-sum{color:#666;font-size:13px}
+.zzm-sum b{color:inherit;font-size:14px}
+.zzm-note{margin:0 0 14px;padding:10px 14px;border-radius:8px;background:rgba(94,114,228,.08);font-size:12.5px;line-height:1.7}
+.zzm table{width:100%}
+.zzm td,.zzm th{vertical-align:middle}
+.zzm .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.zzm .sub{display:block;font-size:11.5px;opacity:.65;font-family:monospace}
+.zzm .rate{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.zzm .dn{color:#19b377}.zzm .up{color:#f0a13c}
+.zzm-bar-bg{height:4px;border-radius:2px;background:rgba(127,127,127,.15);margin-top:4px}
+.zzm-bar-fg{height:4px;border-radius:2px;background:#5e72e4}
+.zzm-empty{padding:30px;text-align:center;opacity:.7}
+.zzm-dlg-ctl{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin-bottom:10px}
+.zzm-dlg-ctl input[type=text]{flex:1;min-width:180px}
+.zzm-dlg-list{max-height:60vh;overflow:auto}
+.zzm-dlg-list td{padding:4px 8px}
+`;
+
+// 二级后缀：按主域名合并时 a.b.com.cn → b.com.cn
+var SLD = { 'com.cn': 1, 'net.cn': 1, 'org.cn': 1, 'gov.cn': 1, 'edu.cn': 1, 'ac.cn': 1,
+            'com.hk': 1, 'com.tw': 1, 'co.uk': 1, 'co.jp': 1, 'com.au': 1, 'com.sg': 1 };
+
+function baseDomain(d) {
+    var p = d.split('.');
+    if (p.length <= 2) return d;
+    return SLD[p.slice(-2).join('.')] ? p.slice(-3).join('.') : p.slice(-2).join('.');
+}
+
+function fmtBytes(b) {
+    b = +b || 0;
+    var u = [ 'B', 'KB', 'MB', 'GB', 'TB' ], i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return (i ? b.toFixed(b < 10 ? 2 : 1) : b) + ' ' + u[i];
+}
+
+function fmtRate(bytesPerSec) {
+    var bits = (bytesPerSec || 0) * 8;
+    if (bits >= 1e6) return (bits / 1e6).toFixed(bits >= 1e8 ? 0 : 1) + ' Mbps';
+    if (bits >= 1e3) return (bits / 1e3).toFixed(0) + ' Kbps';
+    return bits > 0 ? '<1 Kbps' : '0';
+}
+
+function fmtDay(d, today) {
+    var s = d.substr(0, 4) + '-' + d.substr(4, 2) + '-' + d.substr(6, 2);
+    return d === today ? s + '（今天）' : s;
+}
+
+function isMac(id) { return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(id || ''); }
+
+return view.extend({
+    day: null,
+    today: null,
+    prev: {},      // id → { cdl, cul, ts }，算实时速率
+    rates: {},
+
+    load: function() {
+        return Promise.all([
+            callDays().catch(function() { return {}; }),
+            uci.load('zzucampusnetagent')
+        ]);
+    },
+
+    refresh: function() {
+        var self = this;
+        return callDevices(this.day).then(function(r) {
+            self.update(r || {});
+        }).catch(function(e) {
+            dom.content(document.getElementById('zzm-table'),
+                E('div', { 'class': 'zzm-empty' }, [ '读取失败：' + (e && e.message ? e.message : e) ]));
+        });
+    },
+
+    // 用相邻两次轮询的原始计数器差值算速率（只有当天、且设备当前有计数时才有）
+    calcRates: function(r) {
+        var self = this, now = {};
+        (r.devices || []).forEach(function(d) {
+            if (d.cdl === undefined) return;
+            var p = self.prev[d.id];
+            if (p && r.ts > p.ts) {
+                var dt = r.ts - p.ts;
+                self.rates[d.id] = {
+                    dl: Math.max(0, d.cdl - p.cdl) / dt,
+                    ul: Math.max(0, d.cul - p.cul) / dt
+                };
+            }
+            now[d.id] = { cdl: d.cdl, cul: d.cul, ts: r.ts };
+        });
+        this.prev = now;
+    },
+
+    update: function(r) {
+        var self = this;
+        var devs = (r.devices || []).filter(function(d) { return d.rx > 0 || d.tx > 0 || d.domains > 0; });
+        if (r.live) this.calcRates(r); else this.rates = {};
+        devs.sort(function(a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
+
+        var trx = 0, ttx = 0, max = 1;
+        devs.forEach(function(d) { trx += d.rx; ttx += d.tx; max = Math.max(max, d.rx + d.tx); });
+        dom.content(document.getElementById('zzm-sum'), [
+            E('b', {}, [ devs.length + ' 台设备' ]), '　合计 ↓ ', E('b', {}, [ fmtBytes(trx) ]),
+            '　↑ ', E('b', {}, [ fmtBytes(ttx) ]),
+            r.live ? '　（每 5 秒刷新）' : ''
+        ]);
+
+        if (!devs.length) {
+            var on = uci.get('zzucampusnetagent', 'netmon', 'enabled') === '1';
+            dom.content(document.getElementById('zzm-table'), E('div', { 'class': 'zzm-empty' }, [
+                on ? '这一天还没有数据（流量每 5 分钟汇总一次）' : '设备监控未开启：在下方设置中勾选「启用」并保存'
+            ]));
+            return;
+        }
+
+        var rows = devs.map(function(d) {
+            var rt = self.rates[d.id];
+            var nameCell = [ d.name || (isMac(d.id) ? '未知设备' : d.id), E('span', { 'class': 'sub' }, [ isMac(d.id) ? d.id : '（无 MAC）' ]) ];
+            var pct = Math.round((d.rx + d.tx) * 100 / max);
+            return E('tr', { 'class': 'tr' }, [
+                E('td', { 'class': 'td' }, nameCell),
+                E('td', { 'class': 'td' }, [ d.ip || '—' ]),
+                E('td', { 'class': 'td rate' }, r.live ? [
+                    E('span', { 'class': 'dn' }, [ '↓ ' + (rt ? fmtRate(rt.dl) : '…') ]), E('br'),
+                    E('span', { 'class': 'up' }, [ '↑ ' + (rt ? fmtRate(rt.ul) : '…') ])
+                ] : [ '—' ]),
+                E('td', { 'class': 'td num' }, [ fmtBytes(d.rx),
+                    E('div', { 'class': 'zzm-bar-bg' }, [ E('div', { 'class': 'zzm-bar-fg', 'style': 'width:' + pct + '%' }) ]) ]),
+                E('td', { 'class': 'td num' }, [ fmtBytes(d.tx) ]),
+                E('td', { 'class': 'td num' }, [ String(d.domains || 0) ]),
+                E('td', { 'class': 'td' }, [
+                    E('button', { 'class': 'cbi-button cbi-button-action', 'click': ui.createHandlerFn(self, 'showDomains', d) }, [ '访问记录' ]),
+                    ' ',
+                    isMac(d.id) ? E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(self, 'rename', d) }, [ '改名' ]) : ''
+                ])
+            ]);
+        });
+
+        dom.content(document.getElementById('zzm-table'), E('table', { 'class': 'table cbi-section-table' }, [
+            E('tr', { 'class': 'tr table-titles' }, [
+                E('th', { 'class': 'th' }, [ '设备' ]),
+                E('th', { 'class': 'th' }, [ 'IP' ]),
+                E('th', { 'class': 'th' }, [ '实时速率' ]),
+                E('th', { 'class': 'th num' }, [ '下载' ]),
+                E('th', { 'class': 'th num' }, [ '上传' ]),
+                E('th', { 'class': 'th num' }, [ '访问域名数' ]),
+                E('th', { 'class': 'th' }, [ '' ])
+            ])
+        ].concat(rows)));
+    },
+
+    rename: function(d) {
+        var self = this;
+        var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': d.name || '', 'placeholder': '留空 = 恢复为 DHCP 主机名', 'maxlength': 32 });
+        ui.showModal('设备改名：' + d.id, [
+            E('p', {}, [ input ]),
+            E('p', { 'style': 'font-size:12px;opacity:.7' }, [ '不能包含空格（会替换为 _）、引号和等号；最多约 10 个汉字。' ]),
+            E('div', { 'class': 'right' }, [
+                E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, [ '取消' ]), ' ',
+                E('button', { 'class': 'cbi-button cbi-button-positive', 'click': function() {
+                    return callAlias(d.id, input.value.trim()).then(function() {
+                        ui.hideModal();
+                        return self.refresh();
+                    });
+                } }, [ '保存' ])
+            ])
+        ]);
+        input.focus();
+    },
+
+    showDomains: function(d) {
+        var day = this.day;
+        var list = E('div', { 'class': 'zzm-dlg-list' }, [ E('em', {}, [ '加载中…' ]) ]);
+        var search = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '搜索域名' });
+        var merge = E('input', { 'type': 'checkbox', 'checked': true });
+        var data = [];
+
+        var render = function() {
+            var q = search.value.trim().toLowerCase(), rows = data.slice().sort(function(a, b) { return b[1] - a[1]; });
+            if (merge.checked) {
+                var g = {};
+                data.forEach(function(x) {
+                    var b = baseDomain(x[0]);
+                    if (!g[b]) g[b] = [ b, 0, '', 0 ];
+                    g[b][1] += x[1];
+                    if (x[2] > g[b][2]) g[b][2] = x[2];
+                    g[b][3]++;
+                });
+                rows = Object.keys(g).map(function(k) { return g[k]; }).sort(function(a, b) { return b[1] - a[1]; });
+            }
+            if (q) rows = rows.filter(function(x) { return x[0].indexOf(q) >= 0; });
+            var shown = rows.slice(0, 500);
+            dom.content(list, rows.length ? [
+                E('table', { 'class': 'table' }, [
+                    E('tr', { 'class': 'tr table-titles' }, [
+                        E('th', { 'class': 'th' }, [ merge.checked ? '主域名（子域名数）' : '域名' ]),
+                        E('th', { 'class': 'th num' }, [ '查询次数' ]),
+                        E('th', { 'class': 'th num' }, [ '最近' ])
+                    ])
+                ].concat(shown.map(function(x) {
+                    return E('tr', { 'class': 'tr' }, [
+                        E('td', { 'class': 'td' }, [ x[0] + (merge.checked && x[3] > 1 ? '（' + x[3] + '）' : '') ]),
+                        E('td', { 'class': 'td num' }, [ String(x[1]) ]),
+                        E('td', { 'class': 'td num' }, [ x[2] || '' ])
+                    ]);
+                }))),
+                rows.length > shown.length ? E('p', {}, [ '仅显示前 500 条，共 ' + rows.length + ' 条，可用搜索缩小范围' ]) : ''
+            ] : E('em', {}, [ '没有记录' ]));
+        };
+
+        search.addEventListener('input', render);
+        merge.addEventListener('change', render);
+
+        ui.showModal('访问记录：' + (d.name || d.id) + ' · ' + fmtDay(day, this.today), [
+            E('div', { 'class': 'zzm-dlg-ctl' }, [
+                search,
+                E('label', {}, [ merge, ' 按主域名合并' ])
+            ]),
+            list,
+            E('p', { 'style': 'font-size:12px;opacity:.7' }, [
+                '统计的是设备向路由器查询域名的次数（打开网页 / App 后台都会产生），不是访问次数；HTTPS 下看不到具体网址。'
+            ]),
+            E('div', { 'class': 'right' }, [ E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, [ '关闭' ]) ])
+        ], 'cbi-modal');
+
+        return callDomains(d.id, day).then(function(r) {
+            data = (r && r.domains) || [];
+            render();
+        }).catch(function(e) {
+            dom.content(list, E('em', {}, [ '读取失败：' + (e && e.message ? e.message : e) ]));
+        });
+    },
+
+    render: function(data) {
+        var self = this, days = (data[0] && data[0].days) || [];
+        this.today = (data[0] && data[0].today) || '';
+        this.day = this.today || days[0] || '';
+        if (days.indexOf(this.day) < 0 && this.day) days.unshift(this.day);
+
+        var sel = E('select', { 'class': 'cbi-input-select', 'change': function(ev) {
+            self.day = ev.target.value;
+            self.prev = {}; self.rates = {};
+            dom.content(document.getElementById('zzm-table'), E('div', { 'class': 'zzm-empty' }, [ '加载中…' ]));
+            self.refresh();
+        } }, days.map(function(d) { return E('option', { 'value': d }, [ fmtDay(d, self.today) ]); }));
+
+        var m = new form.Map('zzucampusnetagent', null, null);
+        var s = m.section(form.NamedSection, 'netmon', 'netmon', '设置');
+        s.addremove = false;
+        var o;
+
+        o = s.option(form.Flag, 'enabled', '启用',
+            '统计各设备的上传 / 下载流量，并记录各设备查询过的域名。只记录在路由器上，不上传任何地方。');
+        o.default = '0';
+        o.rmempty = false;
+
+        o = s.option(widgets.NetworkSelect, 'iface', '监控的局域网', '可多选（例如 lan 与 lancm）');
+        o.multiple = true;
+        o.nocreate = true;
+        o.default = 'lan';
+
+        o = s.option(form.Flag, 'dns', '记录访问的域名',
+            '开启 dnsmasq 查询日志（写在内存里，每 5 分钟汇总后清空）。关闭后只统计流量。');
+        o.default = '1';
+        o.rmempty = false;
+
+        o = s.option(form.Value, 'retention', '保留天数', '历史数据每小时压缩保存到闪存，超过天数自动删除');
+        o.datatype = 'range(1,365)';
+        o.placeholder = '30';
+        o.default = '30';
+
+        return m.render().then(function(mapEl) {
+            poll.add(function() {
+                return self.day === self.today ? self.refresh() : Promise.resolve();
+            }, 5);
+
+            var page = E('div', { 'class': 'zzm' }, [
+                E('style', { 'type': 'text/css' }, STYLE),
+                E('h2', {}, [ '设备监控' ]),
+                E('div', { 'class': 'zzm-note' }, [
+                    '流量在局域网网桥上按设备计数（开启流量卸载也准确）；访问记录来自 DNS 查询，只能看到域名。',
+                    '设备若自行使用加密 DNS（如浏览器「安全 DNS」），其访问记录会缺失。监控他人设备前请告知使用者。'
+                ]),
+                E('div', { 'class': 'cbi-section' }, [
+                    E('div', { 'class': 'zzm-bar' }, [ E('span', {}, [ '日期 ' ]), sel, E('span', { 'id': 'zzm-sum', 'class': 'zzm-sum' }) ]),
+                    E('div', { 'id': 'zzm-table' }, [ E('div', { 'class': 'zzm-empty' }, [ '加载中…' ]) ])
+                ]),
+                mapEl
+            ]);
+            self.refresh();
+            return page;
+        });
+    }
+});
+ZZU_EOF_JS_NETMON
+
 # ---------- 核心 CLI ----------
 cat > "$BIN" <<'ZZU_EOF_BIN'
 #!/bin/sh
@@ -1174,13 +1494,428 @@ esac
 ZZU_EOF_BIN
 chmod +x "$BIN"
 
+# ---------- 设备监控 CLI ----------
+cat > "$NETMON_BIN" <<'ZZU_EOF_NETMON'
+#!/bin/sh
+# zzunetmon - 设备流量统计 + DNS 访问记录（zzucampusnetagent 附带功能，默认关闭）
+#
+# 流量：在被监控 LAN 网桥的 netdev ingress / egress 钩子（优先级早于 flowtable）上，
+#       用 nft 动态集合按 IP 计数（每个元素一个 counter）。流量卸载的连接同样计入，几乎不占内存；
+#       nlbwmon 依赖 conntrack 计数，开启流量卸载后基本统计不到。
+# 访问：dnsmasq log-queries 写到 /tmp/zzunetmon-dns.<实例>.log，每 5 分钟汇总为「设备 × 域名」次数后清空。
+#       只能看到域名（HTTPS 看不到具体网址）；设备自带 DoH（浏览器安全 DNS 等）时看不到。
+# 数据：/tmp/zzunetmon/{traffic,dns}/YYYYMMDD 存当天与前一天；每小时压缩同步到 /etc/zzunetmon，保留 N 天。
+#       设备以 MAC 区分（IP→MAC 取自 DHCP 租约与邻居表），名称取自 别名 > DHCP 静态分配 > DHCP 租约。
+#
+# 用法:
+#   zzunetmon start                   按配置启用 / 停用（幂等；停用时移除钩子与 DNS 日志，保留历史数据）
+#   zzunetmon stop                    汇总并保存，移除钩子、DNS 日志与定时任务
+#   zzunetmon refresh                 网桥重建后重新挂钩子（hotplug 调用）
+#   zzunetmon collect                 汇总计数器与 DNS 日志（cron 每 5 分钟）
+#   zzunetmon save                    collect 后同步到闪存并清理过期数据（cron 每小时）
+#   zzunetmon days                    有数据的日期（JSON）
+#   zzunetmon devices [YYYYMMDD]      设备流量（JSON；当天含实时增量与原始计数器，供页面算速率）
+#   zzunetmon domains <MAC|IP> [YYYYMMDD]   设备访问过的域名（JSON）
+#   zzunetmon alias <MAC> [名称]      设置 / 清除设备别名
+. /lib/functions/network.sh
+
+CFG=zzucampusnetagent
+SEC=netmon
+TAG=zzunetmon
+RUN=/tmp/zzunetmon
+STORE=/etc/zzunetmon
+DNSLOG=/tmp/zzunetmon-dns   # dnsmasq 日志前缀：放在 /tmp 根下，开机时 dnsmasq 先于本服务启动也能创建文件
+NFT_T=zzunetmon
+LOCK=/var/lock/zzunetmon.lock
+CRON=/etc/crontabs/root
+CRON_TAG="# zzunetmon"
+
+opt() { uci -q get "$CFG.$SEC.$1"; }
+enabled() { [ "$(opt enabled)" = "1" ]; }
+dns_on() { [ "$(opt dns)" != "0" ]; }
+retention() {
+	local r; r=$(opt retention)
+	case "$r" in ''|*[!0-9]*) r=30 ;; esac
+	[ "$r" -lt 1 ] && r=1; [ "$r" -gt 365 ] && r=365
+	echo "$r"
+}
+today() { date +%Y%m%d; }
+day_ago() { date -d "@$(( $(date +%s) - $1 * 86400 ))" +%Y%m%d; }
+valid_day() { case "$1" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;; esac; return 1; }
+valid_id() { case "$1" in ""|*[!0-9a-fA-F:.]*) return 1 ;; esac; return 0; }
+lock() { exec 8>"$LOCK"; command -v flock >/dev/null 2>&1 && flock -x 8; return 0; }
+
+# 配置段不存在时建默认（关闭）
+ensure_section() {
+	[ "$(uci -q get "$CFG.$SEC")" = "netmon" ] && return 0
+	uci set "$CFG.$SEC=netmon"
+	uci set "$CFG.$SEC.enabled=0"
+	uci set "$CFG.$SEC.dns=1"
+	uci set "$CFG.$SEC.retention=30"
+	uci add_list "$CFG.$SEC.iface=lan"
+	uci commit "$CFG"
+}
+
+# ── 流量计数（nft netdev 钩子） ─────────────────────────────────
+
+# 被监控接口 → 每行 "设备 网段/前缀 路由器IP"
+targets() {
+	local i dev sub
+	network_flush_cache
+	for i in $(opt iface); do
+		dev=""; sub=""
+		network_get_device dev "$i"
+		network_get_subnet sub "$i"
+		[ -n "$dev" ] && [ -n "$sub" ] || continue
+		eval "$(ipcalc.sh "$sub")"
+		echo "$dev $NETWORK/$PREFIX ${sub%/*}"
+	done
+}
+
+nft_down() { nft delete table netdev "$NFT_T" 2>/dev/null; rm -f "$RUN/nft.sig" "$RUN/cnt.last"; return 0; }
+
+# 建表（已存在且网桥 / 网段未变则不动，避免计数清零）；$1=force 强制重建
+nft_up() {
+	local t sig
+	t=$(targets)
+	if [ -z "$t" ]; then nft_down; return 1; fi
+	sig=$(echo "$t" | md5sum | cut -c1-12)
+	if [ "$1" != "force" ] && [ "$(cat "$RUN/nft.sig" 2>/dev/null)" = "$sig" ] &&
+	   nft list table netdev "$NFT_T" >/dev/null 2>&1; then
+		return 0
+	fi
+	collect_traffic   # 重建前先把旧计数入账
+	nft delete table netdev "$NFT_T" 2>/dev/null
+	echo "$t" | awk -v T="$NFT_T" '
+		BEGIN {
+			print "table netdev " T " {"
+			print "\tset dl { type ipv4_addr; flags dynamic; size 4096; counter; }"
+			print "\tset ul { type ipv4_addr; flags dynamic; size 4096; counter; }"
+		}
+		{
+			n++
+			# 下行：发往该网段客户端（排除路由器自身发出的，如 DNS 应答、LuCI）
+			printf "\tchain eg%d { type filter hook egress device \"%s\" priority -500; ip daddr %s ip saddr != %s update @dl { ip daddr }; }\n", n, $1, $2, $3
+			# 上行：该网段客户端发出（排除发给路由器自身的）
+			printf "\tchain ig%d { type filter hook ingress device \"%s\" priority -500; ip saddr %s ip daddr != %s update @ul { ip saddr }; }\n", n, $1, $2, $3
+		}
+		END { print "}" }' | nft -f - || { logger -t "$TAG" "failed to create nft table"; return 1; }
+	echo "$sig" > "$RUN/nft.sig"
+	rm -f "$RUN/cnt.last"   # 新表从 0 计数
+	logger -t "$TAG" "counting on: $(echo "$t" | awk '{printf "%s%s(%s)", s, $1, $2; s=" "}')"
+}
+
+# 当前计数器 → 每行 "ip 下行字节 上行字节"
+counters() {
+	{
+		nft list set netdev "$NFT_T" dl 2>/dev/null | tr ',{}' '\n\n\n' | awk '$2 == "counter" { print "d", $1, $6 }'
+		nft list set netdev "$NFT_T" ul 2>/dev/null | tr ',{}' '\n\n\n' | awk '$2 == "counter" { print "u", $1, $6 }'
+	} | awk '{ s[$2] = 1; if ($1 == "d") d[$2] = $3; else u[$2] = $3 }
+		END { for (i in s) printf "%s %.0f %.0f\n", i, d[i], u[i] }'
+}
+
+# IP → MAC（保留历史映射：邻居表条目会过期）
+update_ipmac() {
+	mkdir -p "$RUN"; touch "$RUN/ipmac"
+	{
+		cat "$RUN/ipmac"
+		cat /tmp/dhcp.leases /tmp/dhcp.leases.* 2>/dev/null | awk '$2 ~ /:/ { print $3, tolower($2) }'
+		ip -4 neigh show 2>/dev/null | awk '$4 == "lladdr" && $5 ~ /:/ { print $1, tolower($5) }'
+	} | awk '{ m[$1] = $2 } END { for (i in m) print i, m[i] }' > "$RUN/ipmac.new" && mv "$RUN/ipmac.new" "$RUN/ipmac"
+}
+
+# 计数器增量 → 当天流量文件（每行 "设备 下行 上行 最近IP"；设备 = MAC，未知时为 IP）
+collect_traffic() {
+	local f
+	nft list table netdev "$NFT_T" >/dev/null 2>&1 || return 0
+	f="$RUN/traffic/$(today)"
+	mkdir -p "$RUN/traffic"; touch "$f" "$RUN/cnt.last"
+	update_ipmac
+	counters > "$RUN/cnt.now"
+	awk '
+		FILENAME == ARGV[1] { ld[$1] = $2; lu[$1] = $3; next }
+		FILENAME == ARGV[2] { mac[$1] = $2; next }
+		FILENAME == ARGV[3] { rx[$1] = $2; tx[$1] = $3; lip[$1] = $4; k[$1] = 1; next }
+		{
+			ip = $1
+			dd = (ip in ld && $2 >= ld[ip]) ? $2 - ld[ip] : $2
+			du = (ip in lu && $3 >= lu[ip]) ? $3 - lu[ip] : $3
+			if (dd == 0 && du == 0) next
+			key = (ip in mac) ? mac[ip] : ip
+			rx[key] += dd; tx[key] += du; lip[key] = ip; k[key] = 1
+		}
+		END { for (x in k) printf "%s %.0f %.0f %s\n", x, rx[x], tx[x], lip[x] }
+	' "$RUN/cnt.last" "$RUN/ipmac" "$f" "$RUN/cnt.now" > "$f.new" && mv "$f.new" "$f"
+	mv "$RUN/cnt.now" "$RUN/cnt.last"
+}
+
+# ── DNS 访问记录（dnsmasq log-queries） ────────────────────────
+
+dns_sections() { uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p'; }
+
+# 各 dnsmasq 实例的本地域（如 lan / lancm）：Windows 等会补上该后缀重试（www.x.com.lan、wpad.lan），属于噪声
+local_domains() {
+	local s
+	for s in $(dns_sections); do uci -q get "dhcp.$s.domain"; done | tr 'A-Z' 'a-z' | sort -u | tr '\n' ' '
+}
+
+# 开关各 dnsmasq 实例的查询日志（只改动本程序设置的项）
+dns_log() {
+	local s want changed=0
+	for s in $(dns_sections); do
+		want="$DNSLOG.$(echo "$s" | tr -c 'A-Za-z0-9\n' '_').log"
+		if [ "$1" = "1" ]; then
+			[ "$(uci -q get "dhcp.$s.logqueries")" = "1" ] &&
+			[ "$(uci -q get "dhcp.$s.logfacility")" = "$want" ] && continue
+			uci set "dhcp.$s.logqueries=1"
+			uci set "dhcp.$s.logfacility=$want"
+			changed=1
+		else
+			case "$(uci -q get "dhcp.$s.logfacility")" in
+				"$DNSLOG".*)
+					uci -q delete "dhcp.$s.logqueries"
+					uci -q delete "dhcp.$s.logfacility"
+					changed=1 ;;
+			esac
+		fi
+	done
+	if [ "$changed" = "1" ]; then
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	fi
+	[ "$1" = "1" ] || rm -f "$DNSLOG".*.log
+	return 0
+}
+
+# 日志 → 当天域名文件（每行 "设备 域名 次数 最近时间HH:MM"），然后清空日志
+# 行格式（log-queries=extra）: "Oct  2 03:00:00 dnsmasq[123]: 15 192.168.32.10/5353 query[A] example.com from 192.168.32.10"
+collect_dns() {
+	local f b lf
+	f="$RUN/dns/$(today)"; b="$RUN/dns.batch"
+	mkdir -p "$RUN/dns"; touch "$f"; : > "$b"
+	for lf in "$DNSLOG".*.log; do
+		[ -f "$lf" ] || continue
+		cat "$lf" >> "$b"; : > "$lf"   # 截断而不是删除：dnsmasq 以追加方式写，且该文件被 jail 挂载
+	done
+	if [ -s "$b" ]; then
+		update_ipmac
+		awk -v skip="$(local_domains)" '
+			BEGIN { ns = split(skip, S, " ") }
+			FILENAME == ARGV[1] { mac[$1] = $2; next }
+			FILENAME == ARGV[2] { n[$1 " " $2] = $3; t[$1 " " $2] = $4; next }
+			{
+				q = 0
+				for (i = 4; i < NF - 2; i++) if ($i == "query[A]") { q = i; break }
+				if (!q || $(NF - 1) != "from") next
+				c = $NF; d = tolower($(q + 1))
+				if (c == "127.0.0.1" || c == "::1") next
+				if (d !~ /\./ || d ~ /\.(lan|local|arpa|home|localdomain)$/) next
+				for (j = 1; j <= ns; j++)
+					if (d == S[j] || substr(d, length(d) - length(S[j])) == "." S[j]) next
+				key = ((c in mac) ? mac[c] : c) " " d
+				n[key]++; t[key] = substr($3, 1, 5)
+			}
+			END { for (x in n) print x, n[x], t[x] }
+		' "$RUN/ipmac" "$f" "$b" > "$f.new" && mv "$f.new" "$f"
+	fi
+	rm -f "$b"
+}
+
+# ── 持久化 ───────────────────────────────────────────────────
+
+restore() {
+	local kind d
+	for kind in traffic dns; do
+		mkdir -p "$RUN/$kind"
+		for d in "$(today)" "$(day_ago 1)"; do
+			[ -f "$RUN/$kind/$d" ] || [ ! -f "$STORE/$kind/$d.gz" ] || zcat "$STORE/$kind/$d.gz" > "$RUN/$kind/$d"
+		done
+	done
+}
+
+save_files() {
+	local kind f d cutoff td yd
+	cutoff=$(day_ago "$(retention)"); td=$(today); yd=$(day_ago 1)
+	for kind in traffic dns; do
+		mkdir -p "$STORE/$kind" "$RUN/$kind"
+		for f in "$RUN/$kind"/*; do
+			[ -f "$f" ] || continue
+			d=${f##*/}; valid_day "$d" || continue
+			[ "$STORE/$kind/$d.gz" -nt "$f" ] && continue   # 没变化不写闪存
+			gzip -c "$f" > "$STORE/$kind/$d.gz.tmp" && mv "$STORE/$kind/$d.gz.tmp" "$STORE/$kind/$d.gz"
+		done
+		for f in "$RUN/$kind"/*; do   # 内存里只留今天和昨天
+			[ -f "$f" ] || continue
+			d=${f##*/}; [ "$d" = "$td" ] || [ "$d" = "$yd" ] || rm -f "$f"
+		done
+		for f in "$STORE/$kind"/*.gz; do   # 过期
+			[ -f "$f" ] || continue
+			d=${f##*/}; d=${d%.gz}
+			valid_day "$d" && [ "$d" -lt "$cutoff" ] && rm -f "$f"
+		done
+	done
+}
+
+dayfile() {
+	if [ -f "$RUN/$1/$2" ]; then cat "$RUN/$1/$2"
+	elif [ -f "$STORE/$1/$2.gz" ]; then zcat "$STORE/$1/$2.gz"
+	fi
+}
+
+cron_set() {
+	local before
+	touch "$CRON"
+	before=$(md5sum < "$CRON")
+	sed -i "\|$CRON_TAG|d" "$CRON"
+	if [ "$1" = "1" ]; then
+		echo "*/5 * * * * /usr/sbin/zzunetmon collect >/dev/null 2>&1 $CRON_TAG" >> "$CRON"
+		echo "7 * * * * /usr/sbin/zzunetmon save >/dev/null 2>&1 $CRON_TAG" >> "$CRON"
+	fi
+	[ "$(md5sum < "$CRON")" = "$before" ] || /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+# ── 名称 ─────────────────────────────────────────────────────
+
+# 每行 "mac 名称"，后出现的覆盖先出现的：DHCP 租约 < 静态分配 < 别名
+names() {
+	local s n m a
+	cat /tmp/dhcp.leases /tmp/dhcp.leases.* 2>/dev/null | awk '$2 ~ /:/ && $4 != "*" && $4 != "" { print tolower($2), $4 }'
+	for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=host$/\1/p'); do
+		n=$(uci -q get "dhcp.$s.name"); [ -n "$n" ] || continue
+		for m in $(uci -q get "dhcp.$s.mac"); do echo "$m $n" | awk '{ $1 = tolower($1); print }'; done
+	done
+	for a in $(opt alias); do echo "${a%%=*} ${a#*=}"; done
+}
+
+# ── 输出（JSON） ─────────────────────────────────────────────
+
+# 域名 / 主机名里正常不会出现引号和反斜杠（dnsmasq 会把怪字符写成 \ddd），直接去掉即可保证 JSON 合法
+JSON_ESC='function esc(s) { gsub(/["\\\001-\037]/, "", s); return s }'
+
+cmd_days() {
+	{
+		ls "$RUN/traffic" "$RUN/dns" 2>/dev/null
+		ls "$STORE/traffic" "$STORE/dns" 2>/dev/null | sed 's/\.gz$//'
+		today
+	} | grep -E '^[0-9]{8}$' | sort -ru |
+		awk 'BEGIN { printf "{\"today\":\"'"$(today)"'\",\"days\":[" } { printf "%s\"%s\"", s, $1; s = "," } END { print "]}" }'
+}
+
+cmd_devices() {
+	local day="$1" live=0
+	valid_day "$day" || day=$(today)
+	[ "$day" = "$(today)" ] && live=1
+	{
+		echo "#T"; dayfile traffic "$day"
+		echo "#M"; cat "$RUN/ipmac" 2>/dev/null
+		echo "#N"; names
+		echo "#D"; dayfile dns "$day" | awk '{ c[$1]++ } END { for (m in c) print m, c[m] }'
+		if [ "$live" = "1" ] && nft list table netdev "$NFT_T" >/dev/null 2>&1; then
+			echo "#L"; cat "$RUN/cnt.last" 2>/dev/null
+			echo "#C"; counters
+		fi
+	} | awk -v ts="$(date +%s)" -v day="$day" -v live="$live" "$JSON_ESC"'
+		/^#[A-Z]$/ { sec = $1; next }
+		sec == "#T" { rx[$1] = $2; tx[$1] = $3; ip[$1] = $4; k[$1] = 1; next }
+		sec == "#M" { mac[$1] = $2; next }
+		sec == "#N" { nm[$1] = $2; next }
+		sec == "#D" { dn[$1] = $2; k[$1] = 1; next }
+		sec == "#L" { ld[$1] = $2; lu[$1] = $3; next }
+		sec == "#C" {
+			i = $1; key = (i in mac) ? mac[i] : i
+			rx[key] += (i in ld && $2 >= ld[i]) ? $2 - ld[i] : $2
+			tx[key] += (i in lu && $3 >= lu[i]) ? $3 - lu[i] : $3
+			cd[key] += $2; cu[key] += $3; ip[key] = i; k[key] = 1; on[key] = 1
+			next
+		}
+		END {
+			printf "{\"ts\":%d,\"day\":\"%s\",\"live\":%s,\"devices\":[", ts, day, (live == 1 ? "true" : "false")
+			for (x in k) {
+				printf "%s{\"id\":\"%s\",\"ip\":\"%s\",\"name\":\"%s\",\"rx\":%.0f,\"tx\":%.0f,\"domains\":%d", \
+					s, esc(x), esc(ip[x]), esc(nm[x]), rx[x], tx[x], dn[x]
+				if (on[x]) printf ",\"cdl\":%.0f,\"cul\":%.0f", cd[x], cu[x]
+				printf "}"; s = ","
+			}
+			print "]}"
+		}'
+}
+
+cmd_domains() {
+	local id="$1" day="$2"
+	valid_id "$id" || { echo '{"domains":[]}'; return; }
+	id=$(echo "$id" | tr 'A-F' 'a-f')
+	valid_day "$day" || day=$(today)
+	if [ "$day" = "$(today)" ] && enabled && dns_on; then lock; collect_dns; fi   # 当天先把未汇总的日志入账
+	# 次数放第一列再 sort -nr（BusyBox sort 的 -k2,2nr 实测不按数值排）
+	dayfile dns "$day" | awk -v id="$id" '$1 == id { print $3, $2, $4 }' | sort -nr | head -n 5000 |
+		awk -v id="$id" -v day="$day" "$JSON_ESC"'
+			BEGIN { printf "{\"id\":\"%s\",\"day\":\"%s\",\"domains\":[", id, day }
+			{ printf "%s[\"%s\",%d,\"%s\"]", s, esc($2), $1, esc($3); s = "," }
+			END { print "]}" }'
+}
+
+cmd_alias() {
+	local mac name a
+	mac=$(echo "$1" | tr 'A-F' 'a-f')
+	case "$mac" in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) echo '{"result":0,"msg":"MAC 地址无效"}'; return ;; esac
+	# 名称：去掉空白、引号、反斜杠、等号，最多 32 字节
+	name=$(printf '%s' "$2" | tr -d "\"'\\\\=\t\r\n" | tr ' ' '_' | cut -b1-32)
+	ensure_section
+	for a in $(opt alias); do [ "${a%%=*}" = "$mac" ] && uci -q del_list "$CFG.$SEC.alias=$a"; done
+	[ -n "$name" ] && uci add_list "$CFG.$SEC.alias=$mac=$name"
+	uci commit "$CFG"
+	echo '{"result":1}'
+}
+
+# ── 启停 ─────────────────────────────────────────────────────
+
+teardown() {
+	collect_traffic
+	[ -d "$RUN" ] && save_files
+	nft_down
+	dns_log 0
+	cron_set 0
+}
+
+cmd_start() {
+	ensure_section
+	lock
+	if enabled; then
+		mkdir -p "$RUN"
+		restore
+		nft_up || logger -t "$TAG" "no monitored interface is ready yet (will retry on ifup)"
+		if dns_on; then dns_log 1; else dns_log 0; fi
+		cron_set 1
+	else
+		teardown
+	fi
+}
+
+case "$1" in
+	start)   cmd_start ;;
+	stop)    lock; teardown ;;
+	refresh) enabled || exit 0; lock; mkdir -p "$RUN"; nft_up force ;;
+	collect) enabled || exit 0; lock; collect_traffic; dns_on && collect_dns ;;
+	save)    enabled || exit 0; lock; collect_traffic; dns_on && collect_dns; save_files ;;
+	days)    cmd_days ;;
+	devices) cmd_devices "$2" ;;
+	domains) cmd_domains "$2" "$3" ;;
+	alias)   cmd_alias "$2" "$3" ;;
+	*) echo "usage: $0 {start|stop|refresh|collect|save|days|devices [day]|domains <mac|ip> [day]|alias <mac> [name]}" >&2; exit 1 ;;
+esac
+ZZU_EOF_NETMON
+chmod +x "$NETMON_BIN"
+
 # ---------- rpcd 包装 ----------
 cat > "$RPCD" <<'ZZU_EOF_RPCD'
 #!/bin/sh
 BIN="/usr/sbin/zzucampusnetagent"
+NETMON="/usr/sbin/zzunetmon"
 case "$1" in
 	list)
-		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" },'
+		echo '  "netmon_days": { }, "netmon_devices": { "day": "str" }, "netmon_domains": { "id": "str", "day": "str" }, "netmon_alias": { "id": "str", "name": "str" } }'
 		;;
 	call)
 		read -r input 2>/dev/null
@@ -1188,12 +1923,21 @@ case "$1" in
 		line=$(jsonfilter -s "$input" -e '@.line' 2>/dev/null)
 		# 线路 id 只允许字母数字下划线，其余一律置空（后端取第一条线路）
 		case "$line" in *[!A-Za-z0-9_]*) line="" ;; esac
+		# 设备监控参数：日期只允许数字，设备 id 只允许 MAC / IP 字符
+		day=$(jsonfilter -s "$input" -e '@.day' 2>/dev/null)
+		case "$day" in *[!0-9]*) day="" ;; esac
+		id=$(jsonfilter -s "$input" -e '@.id' 2>/dev/null)
+		case "$id" in *[!0-9A-Fa-f:.]*) id="" ;; esac
 		case "$2" in
 			status) "$BIN" status ;;
 			query)  "$BIN" query  "$line" ;;
 			login)  "$BIN" login  "$line" ;;
 			logout) "$BIN" logout "$line" ;;
 			reauth) "$BIN" relogin "$line" ;;
+			netmon_days)    "$NETMON" days ;;
+			netmon_devices) "$NETMON" devices "$day" ;;
+			netmon_domains) "$NETMON" domains "$id" "$day" ;;
+			netmon_alias)   "$NETMON" alias "$id" "$(jsonfilter -s "$input" -e '@.name' 2>/dev/null)" ;;
 			*) echo '{}' ;;
 		esac
 		;;
@@ -1260,6 +2004,36 @@ service_triggers() {
 ZZU_EOF_INITD
 chmod +x "$INITD"
 
+# ---------- 设备监控 init.d / hotplug ----------
+cat > "$NETMON_INITD" <<'ZZU_EOF_NETMON_INITD'
+#!/bin/sh /etc/rc.common
+# 设备监控（流量统计 + DNS 访问记录）：按 zzucampusnetagent.netmon 配置启用 / 停用
+START=99
+USE_PROCD=1
+
+start_service()  { /usr/sbin/zzunetmon start; }
+reload_service() { /usr/sbin/zzunetmon start; }
+stop_service()   { /usr/sbin/zzunetmon stop; }
+
+service_triggers() {
+	procd_add_reload_trigger "zzucampusnetagent"
+}
+ZZU_EOF_NETMON_INITD
+chmod +x "$NETMON_INITD"
+cat > "$NETMON_HOTPLUG" <<'ZZU_EOF_NETMON_HOTPLUG'
+#!/bin/sh
+# 被监控的 LAN 接口重新上线（网桥会被重建）时，重新挂设备监控的 nft 计数钩子
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$(uci -q get zzucampusnetagent.netmon.enabled)" = "1" ] || exit 0
+for i in $(uci -q get zzucampusnetagent.netmon.iface); do
+	if [ "$i" = "$INTERFACE" ]; then
+		/usr/sbin/zzunetmon refresh >/dev/null 2>&1 &
+		exit 0
+	fi
+done
+exit 0
+ZZU_EOF_NETMON_HOTPLUG
+
 # ---------- 菜单（服务菜单下） ----------
 cat > "$MENU" <<'ZZU_EOF_MENU'
 {
@@ -1267,11 +2041,26 @@ cat > "$MENU" <<'ZZU_EOF_MENU'
 		"title": "ZZU CampusNet Agent",
 		"order": 60,
 		"action": {
-			"type": "view",
-			"path": "zzucampusnetagent/status"
+			"type": "firstchild"
 		},
 		"depends": {
 			"acl": [ "luci-app-zzu-campusnet-agent" ]
+		}
+	},
+	"admin/services/zzucampusnetagent/status": {
+		"title": "认证状态",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "zzucampusnetagent/status"
+		}
+	},
+	"admin/services/zzucampusnetagent/netmon": {
+		"title": "设备监控",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "zzucampusnetagent/netmon"
 		}
 	}
 }
@@ -1284,14 +2073,14 @@ cat > "$ACL" <<'ZZU_EOF_ACL'
 		"description": "Grant access to ZZU campus network status & auth",
 		"read": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "status", "query", "login", "logout" ],
+				"luci.zzucampusnetagent": [ "status", "query", "login", "logout", "netmon_days", "netmon_devices", "netmon_domains" ],
 				"network.interface": [ "dump" ]
 			},
 			"uci": [ "zzucampusnetagent", "network" ]
 		},
 		"write": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "login", "logout", "reauth" ]
+				"luci.zzucampusnetagent": [ "login", "logout", "reauth", "netmon_alias" ]
 			},
 			"uci": [ "zzucampusnetagent" ]
 		}
@@ -1313,6 +2102,13 @@ config zzucampusnetagent 'config'
 	# 故障线路自动摘除（配合 extras/99-multipath）：重登后仍不通的线路暂时移出多路聚合，恢复后加回
 	option failover '1'
 	# list probe_url 'http://connect.rom.miui.com/generate_204'
+
+# 设备监控（各设备流量 + DNS 访问记录），默认关闭，在「设备监控」页面开启
+config netmon 'netmon'
+	option enabled '0'
+	option dns '1'
+	option retention '30'
+	list iface 'lan'
 
 # 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；
 # iface 留空 = 走系统默认路由（单线路时保持留空即可）；account/password 每条线路各自填写。
@@ -1353,9 +2149,21 @@ if ! uci -q show zzucampusnetagent | grep -q '=line$'; then
 	uci commit zzucampusnetagent
 fi
 
+# 设备监控配置段（默认关闭）
+if [ "$(uci -q get zzucampusnetagent.netmon)" != "netmon" ]; then
+	uci set zzucampusnetagent.netmon=netmon
+	uci set zzucampusnetagent.netmon.enabled=0
+	uci set zzucampusnetagent.netmon.dns=1
+	uci set zzucampusnetagent.netmon.retention=30
+	uci add_list zzucampusnetagent.netmon.iface=lan
+	uci commit zzucampusnetagent
+fi
+
 # ---------- 生效 ----------
 "$INITD" enable >/dev/null 2>&1 || true
 "$INITD" restart >/dev/null 2>&1 || "$INITD" start >/dev/null 2>&1 || true
+"$NETMON_INITD" enable >/dev/null 2>&1 || true
+"$NETMON_INITD" restart >/dev/null 2>&1 || true
 /etc/init.d/rpcd restart
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache 2>/dev/null || true

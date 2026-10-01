@@ -1,0 +1,11 @@
+#!/bin/sh
+# 被监控的 LAN 接口重新上线（网桥会被重建）时，重新挂设备监控的 nft 计数钩子
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$(uci -q get zzucampusnetagent.netmon.enabled)" = "1" ] || exit 0
+for i in $(uci -q get zzucampusnetagent.netmon.iface); do
+	if [ "$i" = "$INTERFACE" ]; then
+		/usr/sbin/zzunetmon refresh >/dev/null 2>&1 &
+		exit 0
+	fi
+done
+exit 0

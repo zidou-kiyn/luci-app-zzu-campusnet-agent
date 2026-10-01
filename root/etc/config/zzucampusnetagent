@@ -10,6 +10,13 @@ config zzucampusnetagent 'config'
 	option failover '1'
 	# list probe_url 'http://connect.rom.miui.com/generate_204'
 
+# 设备监控（各设备流量 + DNS 访问记录），默认关闭，在「设备监控」页面开启
+config netmon 'netmon'
+	option enabled '0'
+	option dns '1'
+	option retention '30'
+	list iface 'lan'
+
 # 认证线路：每条线路以所绑定出口接口（iface）的 IP 向认证服务器登录；
 # iface 留空 = 走系统默认路由（单线路时保持留空即可）；account/password 每条线路各自填写。
 config line 'main'

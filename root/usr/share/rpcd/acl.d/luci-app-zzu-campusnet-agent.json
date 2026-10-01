@@ -3,14 +3,14 @@
 		"description": "Grant access to ZZU campus network status & auth",
 		"read": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "status", "query", "login", "logout" ],
+				"luci.zzucampusnetagent": [ "status", "query", "login", "logout", "netmon_days", "netmon_devices", "netmon_domains" ],
 				"network.interface": [ "dump" ]
 			},
 			"uci": [ "zzucampusnetagent", "network" ]
 		},
 		"write": {
 			"ubus": {
-				"luci.zzucampusnetagent": [ "login", "logout", "reauth" ]
+				"luci.zzucampusnetagent": [ "login", "logout", "reauth", "netmon_alias" ]
 			},
 			"uci": [ "zzucampusnetagent" ]
 		}

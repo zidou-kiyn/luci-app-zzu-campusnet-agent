@@ -9,6 +9,7 @@
 - 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
 - 🌐 **外网连通检测**（默认开启）：认证服务器只记录登录状态，运营商侧会话失效后仍显示“在线”。插件对在线线路再以该线路 IP 访问 `generate_204` 检测地址，不通则显示 **外网不通**（可一键「重新认证」）；看门狗隔 3 秒复测仍不通则自动“注销→登录”
 - 🔀 **故障线路自动摘除**（默认开启，配合多线聚合）：重新认证后仍不通的线路暂时移出聚合路由，新连接不再分到坏线上；连续 2 次检测正常后自动加回；同组全部故障时保留全部
+- 📊 **设备监控**（默认关闭，「设备监控」页开启）：各设备实时速率与每日上传 / 下载流量、访问过的域名；开启流量卸载也准确，几乎不占内存，历史按天压缩存闪存（默认 30 天）
 - ⚙ **UI 内可改**：服务器地址 baseurl、定时开关与时间；「认证线路」表格里每行一条线路（名称、账号、密码、出口接口、运营商 移动/联通/电信/校园网/学科专网）
 - 🎨 Argon Design 配色卡片风，贴近 argon 主题
 
@@ -171,7 +172,30 @@ uci commit network; /etc/init.d/network reload
 | `extras/dual-isp-sqm.sh` | （不随包安装）主线路改 macvlan + 分线路 SQM |
 | `extras/quad-wan-setup.sh` / `99-multipath` | （不随包安装）四线聚合 + 组表多路默认路由 hotplug |
 | `htdocs/.../view/zzucampusnetagent/status.js` | LuCI 前端：状态卡片 + 操作按钮 + 设置表单 |
+| `/usr/sbin/zzunetmon` | 设备监控 CLI：nft 计数钩子、DNS 日志汇总、按天存储与 JSON 输出 |
+| `/etc/init.d/zzunetmon` / `hotplug.d/iface/90-zzunetmon` | 按 `netmon` 配置段启停；LAN 网桥重建后重新挂钩子 |
+| `htdocs/.../view/zzucampusnetagent/netmon.js` | LuCI 前端：设备流量表、访问记录弹窗、设置 |
 | `menu.d` / `acl.d` | 菜单（服务下）与权限 |
+
+## 设备监控
+
+LuCI → 服务 → ZZU CampusNet Agent → **设备监控**，勾选「启用」、选择要监控的局域网（可多选）后保存。
+
+| 项目 | 做法 |
+|------|------|
+| 流量 | 在 LAN 网桥的 netdev ingress / egress 钩子（优先级早于 flowtable）上用 nft 动态集合按 IP 计数。nlbwmon 依赖 conntrack 计数，开启流量卸载后几乎统计不到；这里在网桥上计数，卸载的连接同样计入，实测无可见 CPU 开销 |
+| 访问记录 | 打开 dnsmasq `log-queries`，日志写在 `/tmp/zzunetmon-dns.*.log`，每 5 分钟汇总为「设备 × 域名 × 查询次数」后清空。只能看到域名（HTTPS 看不到具体网址）；设备自行使用加密 DNS（浏览器「安全 DNS」、iCloud 专用代理等）时缺失 |
+| 设备识别 | 按 MAC 区分（IP→MAC 取自 DHCP 租约与邻居表），名称：页面里设置的别名 > DHCP 静态分配 > DHCP 主机名 |
+| 存储 | 当天与前一天在 `/tmp/zzunetmon`；每小时压缩同步到 `/etc/zzunetmon`（每天几 KB～几百 KB），超过保留天数自动删除；重启最多丢 1 小时数据 |
+
+```sh
+zzunetmon devices [YYYYMMDD]         # 设备流量 JSON
+zzunetmon domains <MAC> [YYYYMMDD]   # 某设备访问过的域名 JSON
+zzunetmon save                       # 立即汇总并写闪存
+logread -e zzunetmon                 # 计数钩子挂载日志
+```
+
+> 监控他人设备前请告知使用者。
 
 ---
 

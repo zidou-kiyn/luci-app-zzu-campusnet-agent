@@ -1,8 +1,10 @@
 #!/bin/sh
 BIN="/usr/sbin/zzucampusnetagent"
+NETMON="/usr/sbin/zzunetmon"
 case "$1" in
 	list)
-		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" } }'
+		echo '{ "status": { }, "query": { "line": "str" }, "login": { "line": "str" }, "logout": { "line": "str" }, "reauth": { "line": "str" },'
+		echo '  "netmon_days": { }, "netmon_devices": { "day": "str" }, "netmon_domains": { "id": "str", "day": "str" }, "netmon_alias": { "id": "str", "name": "str" } }'
 		;;
 	call)
 		read -r input 2>/dev/null
@@ -10,12 +12,21 @@ case "$1" in
 		line=$(jsonfilter -s "$input" -e '@.line' 2>/dev/null)
 		# 线路 id 只允许字母数字下划线，其余一律置空（后端取第一条线路）
 		case "$line" in *[!A-Za-z0-9_]*) line="" ;; esac
+		# 设备监控参数：日期只允许数字，设备 id 只允许 MAC / IP 字符
+		day=$(jsonfilter -s "$input" -e '@.day' 2>/dev/null)
+		case "$day" in *[!0-9]*) day="" ;; esac
+		id=$(jsonfilter -s "$input" -e '@.id' 2>/dev/null)
+		case "$id" in *[!0-9A-Fa-f:.]*) id="" ;; esac
 		case "$2" in
 			status) "$BIN" status ;;
 			query)  "$BIN" query  "$line" ;;
 			login)  "$BIN" login  "$line" ;;
 			logout) "$BIN" logout "$line" ;;
 			reauth) "$BIN" relogin "$line" ;;
+			netmon_days)    "$NETMON" days ;;
+			netmon_devices) "$NETMON" devices "$day" ;;
+			netmon_domains) "$NETMON" domains "$id" "$day" ;;
+			netmon_alias)   "$NETMON" alias "$id" "$(jsonfilter -s "$input" -e '@.name' 2>/dev/null)" ;;
 			*) echo '{}' ;;
 		esac
 		;;

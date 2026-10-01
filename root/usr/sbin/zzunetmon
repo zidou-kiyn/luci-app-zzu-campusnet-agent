@@ -1,0 +1,408 @@
+#!/bin/sh
+# zzunetmon - 设备流量统计 + DNS 访问记录（zzucampusnetagent 附带功能，默认关闭）
+#
+# 流量：在被监控 LAN 网桥的 netdev ingress / egress 钩子（优先级早于 flowtable）上，
+#       用 nft 动态集合按 IP 计数（每个元素一个 counter）。流量卸载的连接同样计入，几乎不占内存；
+#       nlbwmon 依赖 conntrack 计数，开启流量卸载后基本统计不到。
+# 访问：dnsmasq log-queries 写到 /tmp/zzunetmon-dns.<实例>.log，每 5 分钟汇总为「设备 × 域名」次数后清空。
+#       只能看到域名（HTTPS 看不到具体网址）；设备自带 DoH（浏览器安全 DNS 等）时看不到。
+# 数据：/tmp/zzunetmon/{traffic,dns}/YYYYMMDD 存当天与前一天；每小时压缩同步到 /etc/zzunetmon，保留 N 天。
+#       设备以 MAC 区分（IP→MAC 取自 DHCP 租约与邻居表），名称取自 别名 > DHCP 静态分配 > DHCP 租约。
+#
+# 用法:
+#   zzunetmon start                   按配置启用 / 停用（幂等；停用时移除钩子与 DNS 日志，保留历史数据）
+#   zzunetmon stop                    汇总并保存，移除钩子、DNS 日志与定时任务
+#   zzunetmon refresh                 网桥重建后重新挂钩子（hotplug 调用）
+#   zzunetmon collect                 汇总计数器与 DNS 日志（cron 每 5 分钟）
+#   zzunetmon save                    collect 后同步到闪存并清理过期数据（cron 每小时）
+#   zzunetmon days                    有数据的日期（JSON）
+#   zzunetmon devices [YYYYMMDD]      设备流量（JSON；当天含实时增量与原始计数器，供页面算速率）
+#   zzunetmon domains <MAC|IP> [YYYYMMDD]   设备访问过的域名（JSON）
+#   zzunetmon alias <MAC> [名称]      设置 / 清除设备别名
+. /lib/functions/network.sh
+
+CFG=zzucampusnetagent
+SEC=netmon
+TAG=zzunetmon
+RUN=/tmp/zzunetmon
+STORE=/etc/zzunetmon
+DNSLOG=/tmp/zzunetmon-dns   # dnsmasq 日志前缀：放在 /tmp 根下，开机时 dnsmasq 先于本服务启动也能创建文件
+NFT_T=zzunetmon
+LOCK=/var/lock/zzunetmon.lock
+CRON=/etc/crontabs/root
+CRON_TAG="# zzunetmon"
+
+opt() { uci -q get "$CFG.$SEC.$1"; }
+enabled() { [ "$(opt enabled)" = "1" ]; }
+dns_on() { [ "$(opt dns)" != "0" ]; }
+retention() {
+	local r; r=$(opt retention)
+	case "$r" in ''|*[!0-9]*) r=30 ;; esac
+	[ "$r" -lt 1 ] && r=1; [ "$r" -gt 365 ] && r=365
+	echo "$r"
+}
+today() { date +%Y%m%d; }
+day_ago() { date -d "@$(( $(date +%s) - $1 * 86400 ))" +%Y%m%d; }
+valid_day() { case "$1" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;; esac; return 1; }
+valid_id() { case "$1" in ""|*[!0-9a-fA-F:.]*) return 1 ;; esac; return 0; }
+lock() { exec 8>"$LOCK"; command -v flock >/dev/null 2>&1 && flock -x 8; return 0; }
+
+# 配置段不存在时建默认（关闭）
+ensure_section() {
+	[ "$(uci -q get "$CFG.$SEC")" = "netmon" ] && return 0
+	uci set "$CFG.$SEC=netmon"
+	uci set "$CFG.$SEC.enabled=0"
+	uci set "$CFG.$SEC.dns=1"
+	uci set "$CFG.$SEC.retention=30"
+	uci add_list "$CFG.$SEC.iface=lan"
+	uci commit "$CFG"
+}
+
+# ── 流量计数（nft netdev 钩子） ─────────────────────────────────
+
+# 被监控接口 → 每行 "设备 网段/前缀 路由器IP"
+targets() {
+	local i dev sub
+	network_flush_cache
+	for i in $(opt iface); do
+		dev=""; sub=""
+		network_get_device dev "$i"
+		network_get_subnet sub "$i"
+		[ -n "$dev" ] && [ -n "$sub" ] || continue
+		eval "$(ipcalc.sh "$sub")"
+		echo "$dev $NETWORK/$PREFIX ${sub%/*}"
+	done
+}
+
+nft_down() { nft delete table netdev "$NFT_T" 2>/dev/null; rm -f "$RUN/nft.sig" "$RUN/cnt.last"; return 0; }
+
+# 建表（已存在且网桥 / 网段未变则不动，避免计数清零）；$1=force 强制重建
+nft_up() {
+	local t sig
+	t=$(targets)
+	if [ -z "$t" ]; then nft_down; return 1; fi
+	sig=$(echo "$t" | md5sum | cut -c1-12)
+	if [ "$1" != "force" ] && [ "$(cat "$RUN/nft.sig" 2>/dev/null)" = "$sig" ] &&
+	   nft list table netdev "$NFT_T" >/dev/null 2>&1; then
+		return 0
+	fi
+	collect_traffic   # 重建前先把旧计数入账
+	nft delete table netdev "$NFT_T" 2>/dev/null
+	echo "$t" | awk -v T="$NFT_T" '
+		BEGIN {
+			print "table netdev " T " {"
+			print "\tset dl { type ipv4_addr; flags dynamic; size 4096; counter; }"
+			print "\tset ul { type ipv4_addr; flags dynamic; size 4096; counter; }"
+		}
+		{
+			n++
+			# 下行：发往该网段客户端（排除路由器自身发出的，如 DNS 应答、LuCI）
+			printf "\tchain eg%d { type filter hook egress device \"%s\" priority -500; ip daddr %s ip saddr != %s update @dl { ip daddr }; }\n", n, $1, $2, $3
+			# 上行：该网段客户端发出（排除发给路由器自身的）
+			printf "\tchain ig%d { type filter hook ingress device \"%s\" priority -500; ip saddr %s ip daddr != %s update @ul { ip saddr }; }\n", n, $1, $2, $3
+		}
+		END { print "}" }' | nft -f - || { logger -t "$TAG" "failed to create nft table"; return 1; }
+	echo "$sig" > "$RUN/nft.sig"
+	rm -f "$RUN/cnt.last"   # 新表从 0 计数
+	logger -t "$TAG" "counting on: $(echo "$t" | awk '{printf "%s%s(%s)", s, $1, $2; s=" "}')"
+}
+
+# 当前计数器 → 每行 "ip 下行字节 上行字节"
+counters() {
+	{
+		nft list set netdev "$NFT_T" dl 2>/dev/null | tr ',{}' '\n\n\n' | awk '$2 == "counter" { print "d", $1, $6 }'
+		nft list set netdev "$NFT_T" ul 2>/dev/null | tr ',{}' '\n\n\n' | awk '$2 == "counter" { print "u", $1, $6 }'
+	} | awk '{ s[$2] = 1; if ($1 == "d") d[$2] = $3; else u[$2] = $3 }
+		END { for (i in s) printf "%s %.0f %.0f\n", i, d[i], u[i] }'
+}
+
+# IP → MAC（保留历史映射：邻居表条目会过期）
+update_ipmac() {
+	mkdir -p "$RUN"; touch "$RUN/ipmac"
+	{
+		cat "$RUN/ipmac"
+		cat /tmp/dhcp.leases /tmp/dhcp.leases.* 2>/dev/null | awk '$2 ~ /:/ { print $3, tolower($2) }'
+		ip -4 neigh show 2>/dev/null | awk '$4 == "lladdr" && $5 ~ /:/ { print $1, tolower($5) }'
+	} | awk '{ m[$1] = $2 } END { for (i in m) print i, m[i] }' > "$RUN/ipmac.new" && mv "$RUN/ipmac.new" "$RUN/ipmac"
+}
+
+# 计数器增量 → 当天流量文件（每行 "设备 下行 上行 最近IP"；设备 = MAC，未知时为 IP）
+collect_traffic() {
+	local f
+	nft list table netdev "$NFT_T" >/dev/null 2>&1 || return 0
+	f="$RUN/traffic/$(today)"
+	mkdir -p "$RUN/traffic"; touch "$f" "$RUN/cnt.last"
+	update_ipmac
+	counters > "$RUN/cnt.now"
+	awk '
+		FILENAME == ARGV[1] { ld[$1] = $2; lu[$1] = $3; next }
+		FILENAME == ARGV[2] { mac[$1] = $2; next }
+		FILENAME == ARGV[3] { rx[$1] = $2; tx[$1] = $3; lip[$1] = $4; k[$1] = 1; next }
+		{
+			ip = $1
+			dd = (ip in ld && $2 >= ld[ip]) ? $2 - ld[ip] : $2
+			du = (ip in lu && $3 >= lu[ip]) ? $3 - lu[ip] : $3
+			if (dd == 0 && du == 0) next
+			key = (ip in mac) ? mac[ip] : ip
+			rx[key] += dd; tx[key] += du; lip[key] = ip; k[key] = 1
+		}
+		END { for (x in k) printf "%s %.0f %.0f %s\n", x, rx[x], tx[x], lip[x] }
+	' "$RUN/cnt.last" "$RUN/ipmac" "$f" "$RUN/cnt.now" > "$f.new" && mv "$f.new" "$f"
+	mv "$RUN/cnt.now" "$RUN/cnt.last"
+}
+
+# ── DNS 访问记录（dnsmasq log-queries） ────────────────────────
+
+dns_sections() { uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p'; }
+
+# 各 dnsmasq 实例的本地域（如 lan / lancm）：Windows 等会补上该后缀重试（www.x.com.lan、wpad.lan），属于噪声
+local_domains() {
+	local s
+	for s in $(dns_sections); do uci -q get "dhcp.$s.domain"; done | tr 'A-Z' 'a-z' | sort -u | tr '\n' ' '
+}
+
+# 开关各 dnsmasq 实例的查询日志（只改动本程序设置的项）
+dns_log() {
+	local s want changed=0
+	for s in $(dns_sections); do
+		want="$DNSLOG.$(echo "$s" | tr -c 'A-Za-z0-9\n' '_').log"
+		if [ "$1" = "1" ]; then
+			[ "$(uci -q get "dhcp.$s.logqueries")" = "1" ] &&
+			[ "$(uci -q get "dhcp.$s.logfacility")" = "$want" ] && continue
+			uci set "dhcp.$s.logqueries=1"
+			uci set "dhcp.$s.logfacility=$want"
+			changed=1
+		else
+			case "$(uci -q get "dhcp.$s.logfacility")" in
+				"$DNSLOG".*)
+					uci -q delete "dhcp.$s.logqueries"
+					uci -q delete "dhcp.$s.logfacility"
+					changed=1 ;;
+			esac
+		fi
+	done
+	if [ "$changed" = "1" ]; then
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	fi
+	[ "$1" = "1" ] || rm -f "$DNSLOG".*.log
+	return 0
+}
+
+# 日志 → 当天域名文件（每行 "设备 域名 次数 最近时间HH:MM"），然后清空日志
+# 行格式（log-queries=extra）: "Oct  2 03:00:00 dnsmasq[123]: 15 192.168.32.10/5353 query[A] example.com from 192.168.32.10"
+collect_dns() {
+	local f b lf
+	f="$RUN/dns/$(today)"; b="$RUN/dns.batch"
+	mkdir -p "$RUN/dns"; touch "$f"; : > "$b"
+	for lf in "$DNSLOG".*.log; do
+		[ -f "$lf" ] || continue
+		cat "$lf" >> "$b"; : > "$lf"   # 截断而不是删除：dnsmasq 以追加方式写，且该文件被 jail 挂载
+	done
+	if [ -s "$b" ]; then
+		update_ipmac
+		awk -v skip="$(local_domains)" '
+			BEGIN { ns = split(skip, S, " ") }
+			FILENAME == ARGV[1] { mac[$1] = $2; next }
+			FILENAME == ARGV[2] { n[$1 " " $2] = $3; t[$1 " " $2] = $4; next }
+			{
+				q = 0
+				for (i = 4; i < NF - 2; i++) if ($i == "query[A]") { q = i; break }
+				if (!q || $(NF - 1) != "from") next
+				c = $NF; d = tolower($(q + 1))
+				if (c == "127.0.0.1" || c == "::1") next
+				if (d !~ /\./ || d ~ /\.(lan|local|arpa|home|localdomain)$/) next
+				for (j = 1; j <= ns; j++)
+					if (d == S[j] || substr(d, length(d) - length(S[j])) == "." S[j]) next
+				key = ((c in mac) ? mac[c] : c) " " d
+				n[key]++; t[key] = substr($3, 1, 5)
+			}
+			END { for (x in n) print x, n[x], t[x] }
+		' "$RUN/ipmac" "$f" "$b" > "$f.new" && mv "$f.new" "$f"
+	fi
+	rm -f "$b"
+}
+
+# ── 持久化 ───────────────────────────────────────────────────
+
+restore() {
+	local kind d
+	for kind in traffic dns; do
+		mkdir -p "$RUN/$kind"
+		for d in "$(today)" "$(day_ago 1)"; do
+			[ -f "$RUN/$kind/$d" ] || [ ! -f "$STORE/$kind/$d.gz" ] || zcat "$STORE/$kind/$d.gz" > "$RUN/$kind/$d"
+		done
+	done
+}
+
+save_files() {
+	local kind f d cutoff td yd
+	cutoff=$(day_ago "$(retention)"); td=$(today); yd=$(day_ago 1)
+	for kind in traffic dns; do
+		mkdir -p "$STORE/$kind" "$RUN/$kind"
+		for f in "$RUN/$kind"/*; do
+			[ -f "$f" ] || continue
+			d=${f##*/}; valid_day "$d" || continue
+			[ "$STORE/$kind/$d.gz" -nt "$f" ] && continue   # 没变化不写闪存
+			gzip -c "$f" > "$STORE/$kind/$d.gz.tmp" && mv "$STORE/$kind/$d.gz.tmp" "$STORE/$kind/$d.gz"
+		done
+		for f in "$RUN/$kind"/*; do   # 内存里只留今天和昨天
+			[ -f "$f" ] || continue
+			d=${f##*/}; [ "$d" = "$td" ] || [ "$d" = "$yd" ] || rm -f "$f"
+		done
+		for f in "$STORE/$kind"/*.gz; do   # 过期
+			[ -f "$f" ] || continue
+			d=${f##*/}; d=${d%.gz}
+			valid_day "$d" && [ "$d" -lt "$cutoff" ] && rm -f "$f"
+		done
+	done
+}
+
+dayfile() {
+	if [ -f "$RUN/$1/$2" ]; then cat "$RUN/$1/$2"
+	elif [ -f "$STORE/$1/$2.gz" ]; then zcat "$STORE/$1/$2.gz"
+	fi
+}
+
+cron_set() {
+	local before
+	touch "$CRON"
+	before=$(md5sum < "$CRON")
+	sed -i "\|$CRON_TAG|d" "$CRON"
+	if [ "$1" = "1" ]; then
+		echo "*/5 * * * * /usr/sbin/zzunetmon collect >/dev/null 2>&1 $CRON_TAG" >> "$CRON"
+		echo "7 * * * * /usr/sbin/zzunetmon save >/dev/null 2>&1 $CRON_TAG" >> "$CRON"
+	fi
+	[ "$(md5sum < "$CRON")" = "$before" ] || /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+# ── 名称 ─────────────────────────────────────────────────────
+
+# 每行 "mac 名称"，后出现的覆盖先出现的：DHCP 租约 < 静态分配 < 别名
+names() {
+	local s n m a
+	cat /tmp/dhcp.leases /tmp/dhcp.leases.* 2>/dev/null | awk '$2 ~ /:/ && $4 != "*" && $4 != "" { print tolower($2), $4 }'
+	for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=host$/\1/p'); do
+		n=$(uci -q get "dhcp.$s.name"); [ -n "$n" ] || continue
+		for m in $(uci -q get "dhcp.$s.mac"); do echo "$m $n" | awk '{ $1 = tolower($1); print }'; done
+	done
+	for a in $(opt alias); do echo "${a%%=*} ${a#*=}"; done
+}
+
+# ── 输出（JSON） ─────────────────────────────────────────────
+
+# 域名 / 主机名里正常不会出现引号和反斜杠（dnsmasq 会把怪字符写成 \ddd），直接去掉即可保证 JSON 合法
+JSON_ESC='function esc(s) { gsub(/["\\\001-\037]/, "", s); return s }'
+
+cmd_days() {
+	{
+		ls "$RUN/traffic" "$RUN/dns" 2>/dev/null
+		ls "$STORE/traffic" "$STORE/dns" 2>/dev/null | sed 's/\.gz$//'
+		today
+	} | grep -E '^[0-9]{8}$' | sort -ru |
+		awk 'BEGIN { printf "{\"today\":\"'"$(today)"'\",\"days\":[" } { printf "%s\"%s\"", s, $1; s = "," } END { print "]}" }'
+}
+
+cmd_devices() {
+	local day="$1" live=0
+	valid_day "$day" || day=$(today)
+	[ "$day" = "$(today)" ] && live=1
+	{
+		echo "#T"; dayfile traffic "$day"
+		echo "#M"; cat "$RUN/ipmac" 2>/dev/null
+		echo "#N"; names
+		echo "#D"; dayfile dns "$day" | awk '{ c[$1]++ } END { for (m in c) print m, c[m] }'
+		if [ "$live" = "1" ] && nft list table netdev "$NFT_T" >/dev/null 2>&1; then
+			echo "#L"; cat "$RUN/cnt.last" 2>/dev/null
+			echo "#C"; counters
+		fi
+	} | awk -v ts="$(date +%s)" -v day="$day" -v live="$live" "$JSON_ESC"'
+		/^#[A-Z]$/ { sec = $1; next }
+		sec == "#T" { rx[$1] = $2; tx[$1] = $3; ip[$1] = $4; k[$1] = 1; next }
+		sec == "#M" { mac[$1] = $2; next }
+		sec == "#N" { nm[$1] = $2; next }
+		sec == "#D" { dn[$1] = $2; k[$1] = 1; next }
+		sec == "#L" { ld[$1] = $2; lu[$1] = $3; next }
+		sec == "#C" {
+			i = $1; key = (i in mac) ? mac[i] : i
+			rx[key] += (i in ld && $2 >= ld[i]) ? $2 - ld[i] : $2
+			tx[key] += (i in lu && $3 >= lu[i]) ? $3 - lu[i] : $3
+			cd[key] += $2; cu[key] += $3; ip[key] = i; k[key] = 1; on[key] = 1
+			next
+		}
+		END {
+			printf "{\"ts\":%d,\"day\":\"%s\",\"live\":%s,\"devices\":[", ts, day, (live == 1 ? "true" : "false")
+			for (x in k) {
+				printf "%s{\"id\":\"%s\",\"ip\":\"%s\",\"name\":\"%s\",\"rx\":%.0f,\"tx\":%.0f,\"domains\":%d", \
+					s, esc(x), esc(ip[x]), esc(nm[x]), rx[x], tx[x], dn[x]
+				if (on[x]) printf ",\"cdl\":%.0f,\"cul\":%.0f", cd[x], cu[x]
+				printf "}"; s = ","
+			}
+			print "]}"
+		}'
+}
+
+cmd_domains() {
+	local id="$1" day="$2"
+	valid_id "$id" || { echo '{"domains":[]}'; return; }
+	id=$(echo "$id" | tr 'A-F' 'a-f')
+	valid_day "$day" || day=$(today)
+	if [ "$day" = "$(today)" ] && enabled && dns_on; then lock; collect_dns; fi   # 当天先把未汇总的日志入账
+	# 次数放第一列再 sort -nr（BusyBox sort 的 -k2,2nr 实测不按数值排）
+	dayfile dns "$day" | awk -v id="$id" '$1 == id { print $3, $2, $4 }' | sort -nr | head -n 5000 |
+		awk -v id="$id" -v day="$day" "$JSON_ESC"'
+			BEGIN { printf "{\"id\":\"%s\",\"day\":\"%s\",\"domains\":[", id, day }
+			{ printf "%s[\"%s\",%d,\"%s\"]", s, esc($2), $1, esc($3); s = "," }
+			END { print "]}" }'
+}
+
+cmd_alias() {
+	local mac name a
+	mac=$(echo "$1" | tr 'A-F' 'a-f')
+	case "$mac" in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) echo '{"result":0,"msg":"MAC 地址无效"}'; return ;; esac
+	# 名称：去掉空白、引号、反斜杠、等号，最多 32 字节
+	name=$(printf '%s' "$2" | tr -d "\"'\\\\=\t\r\n" | tr ' ' '_' | cut -b1-32)
+	ensure_section
+	for a in $(opt alias); do [ "${a%%=*}" = "$mac" ] && uci -q del_list "$CFG.$SEC.alias=$a"; done
+	[ -n "$name" ] && uci add_list "$CFG.$SEC.alias=$mac=$name"
+	uci commit "$CFG"
+	echo '{"result":1}'
+}
+
+# ── 启停 ─────────────────────────────────────────────────────
+
+teardown() {
+	collect_traffic
+	[ -d "$RUN" ] && save_files
+	nft_down
+	dns_log 0
+	cron_set 0
+}
+
+cmd_start() {
+	ensure_section
+	lock
+	if enabled; then
+		mkdir -p "$RUN"
+		restore
+		nft_up || logger -t "$TAG" "no monitored interface is ready yet (will retry on ifup)"
+		if dns_on; then dns_log 1; else dns_log 0; fi
+		cron_set 1
+	else
+		teardown
+	fi
+}
+
+case "$1" in
+	start)   cmd_start ;;
+	stop)    lock; teardown ;;
+	refresh) enabled || exit 0; lock; mkdir -p "$RUN"; nft_up force ;;
+	collect) enabled || exit 0; lock; collect_traffic; dns_on && collect_dns ;;
+	save)    enabled || exit 0; lock; collect_traffic; dns_on && collect_dns; save_files ;;
+	days)    cmd_days ;;
+	devices) cmd_devices "$2" ;;
+	domains) cmd_domains "$2" "$3" ;;
+	alias)   cmd_alias "$2" "$3" ;;
+	*) echo "usage: $0 {start|stop|refresh|collect|save|days|devices [day]|domains <mac|ip> [day]|alias <mac> [name]}" >&2; exit 1 ;;
+esac

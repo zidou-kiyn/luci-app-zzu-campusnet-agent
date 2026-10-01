@@ -1,4 +1,13 @@
 #!/bin/sh
 # 升级安装时把旧版配置（主线路存于 config 段）迁移为 line 段
 [ -x /usr/sbin/zzucampusnetagent ] && /usr/sbin/zzucampusnetagent migrate >/dev/null 2>&1
+# 升级时保留了旧配置文件：补上设备监控配置段（默认关闭）
+if [ "$(uci -q get zzucampusnetagent.netmon)" != "netmon" ]; then
+	uci set zzucampusnetagent.netmon=netmon
+	uci set zzucampusnetagent.netmon.enabled=0
+	uci set zzucampusnetagent.netmon.dns=1
+	uci set zzucampusnetagent.netmon.retention=30
+	uci add_list zzucampusnetagent.netmon.iface=lan
+	uci commit zzucampusnetagent
+fi
 exit 0

@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# 设备监控（流量统计 + DNS 访问记录）：按 zzucampusnetagent.netmon 配置启用 / 停用
+START=99
+USE_PROCD=1
+
+start_service()  { /usr/sbin/zzunetmon start; }
+reload_service() { /usr/sbin/zzunetmon start; }
+stop_service()   { /usr/sbin/zzunetmon stop; }
+
+service_triggers() {
+	procd_add_reload_trigger "zzucampusnetagent"
+}
