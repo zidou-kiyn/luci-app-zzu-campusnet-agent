@@ -536,8 +536,16 @@ return view.extend({
         o.default = '0';
         o.rmempty = false;
 
-        o = s.option(form.Value, 'watchdog_interval', '检查间隔（分钟）', '1–59，默认 5');
-        o.datatype = 'range(1,59)';
+        o = s.option(form.Value, 'watchdog_interval', '检查间隔',
+            '纯数字为分钟（1–59，由 cron 定时执行）；加 s 后缀为秒（2s–59s，常驻进程每隔该秒数探测各线路外网，不通立即处理，另每分钟做一次完整检查）。如 5 或 5s');
+        o.validate = function(id, v) {
+            if (v == null || v === '') return true;
+            var m = /^(\d+)([sS]?)$/.exec(String(v).trim());
+            if (!m) return '格式：分钟数（如 5）或秒数加 s（如 5s）';
+            var n = +m[1];
+            if (m[2]) return (n >= 2 && n <= 59) || '秒级间隔范围 2s–59s';
+            return (n >= 1 && n <= 59) || '分钟间隔范围 1–59';
+        };
         o.placeholder = '5';
         o.default = '5';
         o.depends('watchdog', '1');
@@ -588,6 +596,16 @@ return view.extend({
 
         o = ls.option(form.ListValue, 'isp', '运营商');
         addIsp(o);
+
+        o = ls.option(form.Value, 'reauth_time', '额外重认证',
+            '可选，HH:MM。每天到点单独对该线路注销后重登（与上方全局定时互不影响）');
+        o.placeholder = '如 00:30';
+        o.optional = true;
+        o.rmempty = true;
+        o.validate = function(id, v) {
+            if (v == null || v === '') return true;
+            return /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(v).trim()) || '格式 HH:MM，如 00:30';
+        };
 
         return m.render().then(function(mapEl) {
             poll.add(function() { return self.refresh(); }, 10);
@@ -960,8 +978,10 @@ cat > "$BIN" <<'ZZU_EOF_BIN'
 #   zzucampusnetagent logout [线路]       注销单条线路（默认第一条）
 #   zzucampusnetagent reauth [线路]       注销→隔1s→登录；不带参数则对全部线路执行
 #   zzucampusnetagent relogin [线路]      同 reauth（单条线路），输出登录结果 JSON（供页面调用）
-#   zzucampusnetagent watchdog            检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登；
+#   zzucampusnetagent watchdog [线路...]  检查线路（默认全部）：离线的自动登录；认证在线但外网不通的注销后重登；
 #                                         仍不通的线路从多路聚合中摘除，恢复后自动加回
+#   zzucampusnetagent watchdog-loop 秒    常驻快速检测（procd 托管）：每 N 秒以各线路 IP 探测外网，
+#                                         不通的线路立即走 watchdog；另每 60 秒做一次完整 watchdog
 #   zzucampusnetagent migrate             把旧版配置迁移为新版（见 migrate()）
 #
 # 线路: UCI 中类型为 line 的段，段名即线路 id（旧版主线路迁移后为 "main"），
@@ -1142,29 +1162,57 @@ PROBE_URLS_DEFAULT="http://connect.rom.miui.com/generate_204 http://connectivity
 probe_on() { [ "$(cfg probe)" != "0" ]; }
 probe_urls() { local u; u=$(cfg probe_url); echo "${u:-$PROBE_URLS_DEFAULT}"; }
 
-# probe_net [源IP]：依次请求 probe_url，任一返回 HTTP 204 即为通
+# 单次探测：输出 "HTTP状态码 curl退出码"。正常约 50ms，连接超时 2s 已留足余量
+probe_one() {
+	local c
+	c=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
+		${2:+--interface "$2"} "$1" 2>/dev/null)
+	echo "${c:-000} $?"
+}
+
+# 探测结果归类（stdin 为若干行 probe_one 输出）：0 通 / 1 不通 / 2 无法判断
+probe_judge() {
+	awk '$1=="204"{ok=1} $2!="6"{tried=1} END{exit ok?0:(tried?1:2)}'
+}
+
+# probe_net [源IP]：并行请求全部 probe_url，任一返回 HTTP 204 即为通（不通时最多等一个超时，而非逐个叠加）
 # 返回 0 通 / 1 不通 / 2 无法判断（无 curl、DNS 解析失败——不据此重登，避免误判）
 # 只认 204：未认证时校园网会把 HTTP 劫持到认证页（200/302），不能算通
 probe_net() {
-	local u code rc tried=0
+	local u
 	command -v curl >/dev/null 2>&1 || return 2
-	for u in $(probe_urls); do
-		code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
-			${1:+--interface "$1"} "$u" 2>/dev/null)
-		rc=$?
-		[ "$code" = "204" ] && return 0
-		[ "$rc" = "6" ] && continue
-		tried=1
-	done
-	[ "$tried" = "1" ] && return 1
-	return 2
+	for u in $(probe_urls); do probe_one "$u" "$1" & done | probe_judge
 }
 
-# 隔 3 秒两轮都不通才算不通（过滤瞬时抖动），供 watchdog 判定
+# 轻量探测（快速检查用）：只请求第一个地址，正常时每轮每条线路仅一个请求；
+# 不通不下结论，只作为触发确认的信号（DNS 失败等无法判断时退回全部地址）
+probe_quick() {
+	local u r
+	command -v curl >/dev/null 2>&1 || return 2
+	set -- "$1" $(probe_urls)
+	probe_one "$2" "$1" | probe_judge; r=$?
+	[ $r -eq 2 ] && { probe_net "$1"; r=$?; }
+	return $r
+}
+
+# 确认不通：再探 NET_CONFIRM 轮（每轮全部地址并行、间隔 1 秒），任何一轮通或无法判断都不算不通。
+# 加上触发它的那次失败，要求连续 3 轮、跨度约 2–6 秒、两个地址全部失败——
+# 比旧版「隔 3 秒两轮」更严格，但快得多（旧版不通时单轮就可能等 6 秒超时）
+NET_CONFIRM=2
+net_confirm() {
+	local i=0
+	while [ $i -lt "$NET_CONFIRM" ]; do
+		sleep 1
+		probe_net "$1"; [ $? -eq 1 ] || return 1
+		i=$((i + 1))
+	done
+	return 0
+}
+
+# 完整判定：首轮不通再走确认，供 watchdog 使用
 net_down() {
 	probe_net "$1"; [ $? -eq 1 ] || return 1
-	sleep 3
-	probe_net "$1"; [ $? -eq 1 ]
+	net_confirm "$1"
 }
 
 # ── 故障线路自动摘除（配合 extras/99-multipath）──
@@ -1198,7 +1246,7 @@ line_health() {
 	resolve_bind "$1" || return 2
 	probe_net "$BIND"; r=$?
 	[ $r -eq 1 ] || return $r
-	sleep 3
+	sleep 1
 	probe_net "$BIND"
 }
 
@@ -1442,11 +1490,19 @@ cmd_reauth() {
 # 认证在线但外网不通（运营商侧会话失效）→ 注销后重新登录；
 # 认证服务器不可达 / 外网无法判断 → 不动作；
 # 处理完后再按外网健康决定是否从多路聚合中摘除 / 加回
+# -c：调用方（快速检测）已确认这些线路外网不通，认证在线时直接重登不再重复确认；
+#     但若等锁超过 1 秒（期间可能有定时重授权等改变了状态），确认作废，重新完整判定
 cmd_watchdog() {
-	local id st
+	local id st ids confirmed=0 t0
+	[ "$1" = "-c" ] && { confirmed=1; shift; }
+	ids="$*"
+	t0=$(date +%s)
 	exec 9>"$LOCK"; lock_fd
+	[ $(( $(date +%s) - t0 )) -gt 1 ] && confirmed=0
 	fo_gc
-	for id in $(line_ids); do
+	[ -n "$ids" ] || ids=$(line_ids)
+	for id in $ids; do
+		line_exists "$id" || continue
 		st=$(query_state "$id")
 		case "$st" in
 		offline)
@@ -1454,7 +1510,8 @@ cmd_watchdog() {
 			logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(line_state "$id")"
 			;;
 		online)
-			if probe_on && resolve_bind "$id" && net_down "$BIND"; then
+			if probe_on && resolve_bind "$id" &&
+			   { [ "$confirmed" = "1" ] || net_down "$BIND"; }; then
 				logger -t "$TAG" "watchdog: [$id] portal online but internet unreachable, re-auth"
 				reauth_one "$id"
 			fi
@@ -1464,6 +1521,42 @@ cmd_watchdog() {
 		[ -n "$(lget "$id" iface)" ] || continue
 		line_health "$id"
 		case $? in 0) fo_ok "$id" ;; 1) fo_mark "$id" ;; esac
+	done
+}
+
+# 常驻快速检测：轮询只做外网探测（各线路并行，正常时每条一次 HTTP 204 请求，不打扰认证服务器）；
+# 探测不通的线路立即并行确认（net_confirm），确认不通的交给子进程 watchdog -c 处理
+# （认证查询、重登、故障摘除），确认时又通了的（瞬时抖动）不动作；
+# 处理过的线路 WD_HOLD 秒内不再快速探测，防止持续故障时反复重登；
+# 每 WD_FULL 秒跑一次完整 watchdog（覆盖未开外网检测、故障线路恢复等情况）
+WD_FULL=60
+WD_HOLD=30
+cmd_wdloop() {
+	local iv="$1" now last=0 bad id h self="/usr/sbin/zzucampusnetagent"
+	case "$iv" in ""|*[!0-9]*) iv=5 ;; esac
+	[ "$iv" -lt 2 ] && iv=2
+	[ -x "$self" ] || self="$0"
+	logger -t "$TAG" "watchdog loop started (probe every ${iv}s, full check every ${WD_FULL}s)"
+	while :; do
+		now=$(date +%s)
+		if [ $((now - last)) -ge "$WD_FULL" ]; then
+			"$self" watchdog >/dev/null 2>&1
+			last=$(date +%s)
+		elif probe_on; then
+			bad=$(for id in $(line_ids); do
+				eval "h=\${HOLD_$id:-0}"
+				[ "$now" -lt "$h" ] && continue
+				( resolve_bind "$id" || exit 0
+				  probe_quick "$BIND"; [ $? -eq 1 ] || exit 0
+				  net_confirm "$BIND" && echo "$id" ) &
+			done; wait)
+			if [ -n "$bad" ]; then
+				"$self" watchdog -c $bad >/dev/null 2>&1
+				h=$(( $(date +%s) + WD_HOLD ))
+				for id in $bad; do eval "HOLD_$id=$h"; done
+			fi
+		fi
+		sleep "$iv"
 	done
 }
 
@@ -1488,8 +1581,9 @@ case "$1" in
 	logout)   cmd_logout "$line" ;;
 	reauth)   cmd_reauth "$2" ;;
 	relogin)  cmd_relogin "$line" ;;
-	watchdog) cmd_watchdog ;;
-	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|relogin [line]|watchdog|migrate}" >&2; exit 1 ;;
+	watchdog) shift; cmd_watchdog "$@" ;;
+	watchdog-loop) cmd_wdloop "$2" ;;
+	*) echo "usage: $0 {status|query [line]|login [line]|logout [line]|reauth [line]|relogin [line]|watchdog [line...]|watchdog-loop secs|migrate}" >&2; exit 1 ;;
 esac
 ZZU_EOF_BIN
 chmod +x "$BIN"
@@ -1952,46 +2046,93 @@ START=99
 USE_PROCD=1
 CRON="/etc/crontabs/root"
 TAG="# zzucampusnetagent-reauth"
+TAG_LINE="# zzucampusnetagent-reauth-line"
 TAG_WD="# zzucampusnetagent-watchdog"
+BIN="/usr/sbin/zzucampusnetagent"
+
+# 掉线检测间隔：纯数字 = 分钟（1–59，cron）；带 s 后缀 = 秒（2–59，常驻进程）
+# 输出 "m N" 或 "s N"
+wd_period() {
+	local iv n
+	iv=$(uci -q get zzucampusnetagent.config.watchdog_interval)
+	case "$iv" in
+		*s|*S)
+			n=$(printf '%d' "${iv%?}" 2>/dev/null || echo 5)
+			[ "$n" -lt 2 ] && n=2; [ "$n" -gt 59 ] && n=59
+			echo "s $n" ;;
+		*)
+			n=$(printf '%d' "${iv:-5}" 2>/dev/null || echo 5)
+			[ "$n" -lt 1 ] && n=1; [ "$n" -gt 59 ] && n=59
+			echo "m $n" ;;
+	esac
+}
+
+# HH:MM → "M H"（非法返回 1）
+hm_cron() {
+	local h m
+	case "$1" in [0-9]:[0-5][0-9]|[0-2][0-9]:[0-5][0-9]) ;; *) return 1 ;; esac
+	h=${1%%:*}; m=${1##*:}
+	h=${h#0}; m=${m#0}
+	h=${h:-0}; m=${m:-0}
+	[ "$h" -le 23 ] || return 1
+	echo "$m $h"
+}
+
+# 各线路的额外定时重认证（line 段 reauth_time，可多个）
+line_cron() {
+	local id t mh
+	for id in $(uci -q show zzucampusnetagent | sed -n "s/^zzucampusnetagent\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+		[ "$(uci -q get "zzucampusnetagent.$id.enabled")" = "0" ] && continue
+		for t in $(uci -q get "zzucampusnetagent.$id.reauth_time"); do
+			mh=$(hm_cron "$t") || continue
+			echo "$mh * * * $BIN reauth $id >/dev/null 2>&1 $TAG_LINE"
+		done
+	done
+}
 
 sync_cron() {
-	local enabled time hour min wd iv
+	local enabled time mh wd mode iv lines
 	enabled=$(uci -q get zzucampusnetagent.config.auto_relogin)
 	time=$(uci -q get zzucampusnetagent.config.relogin_time)
-	[ -z "$time" ] && time="06:00"
-	hour=${time%%:*}; min=${time##*:}
-	[ -z "$hour" ] && hour=6
-	[ -z "$min" ]  && min=0
-	hour=$(printf '%d' "$hour" 2>/dev/null || echo 6)
-	min=$(printf '%d' "$min" 2>/dev/null || echo 0)
+	mh=$(hm_cron "${time:-06:00}") || mh="0 6"
 
 	wd=$(uci -q get zzucampusnetagent.config.watchdog)
-	iv=$(uci -q get zzucampusnetagent.config.watchdog_interval)
-	iv=$(printf '%d' "${iv:-5}" 2>/dev/null || echo 5)
-	[ "$iv" -lt 1 ] && iv=1
-	[ "$iv" -gt 59 ] && iv=59
+	set -- $(wd_period); mode=$1; iv=$2
+	lines=$(line_cron)
 
 	mkdir -p /etc/crontabs
 	[ -f "$CRON" ] || touch "$CRON"
+	# TAG 是 TAG_LINE 的前缀，一并删除
 	sed -i -e "\|$TAG|d" -e "\|$TAG_WD|d" "$CRON"
 	if [ "$enabled" = "1" ]; then
-		echo "$min $hour * * * /usr/sbin/zzucampusnetagent reauth >/dev/null 2>&1 $TAG" >> "$CRON"
+		echo "$mh * * * $BIN reauth >/dev/null 2>&1 $TAG" >> "$CRON"
 	fi
-	if [ "$wd" = "1" ]; then
-		echo "*/$iv * * * * /usr/sbin/zzucampusnetagent watchdog >/dev/null 2>&1 $TAG_WD" >> "$CRON"
+	[ -n "$lines" ] && echo "$lines" >> "$CRON"
+	if [ "$wd" = "1" ] && [ "$mode" = "m" ]; then
+		echo "*/$iv * * * * $BIN watchdog >/dev/null 2>&1 $TAG_WD" >> "$CRON"
 	fi
-	if [ "$enabled" = "1" ] || [ "$wd" = "1" ]; then
+	if [ "$enabled" = "1" ] || [ -n "$lines" ] || [ "$wd" = "1" ]; then
 		/etc/init.d/cron enable >/dev/null 2>&1
 	fi
 	/etc/init.d/cron restart >/dev/null 2>&1
 }
 
 # 旧版配置（主线路存于 config 段）迁移为 line 段
-migrate() { [ -x /usr/sbin/zzucampusnetagent ] && /usr/sbin/zzucampusnetagent migrate >/dev/null 2>&1; }
+migrate() { [ -x "$BIN" ] && "$BIN" migrate >/dev/null 2>&1; }
 
-start_service()  { migrate; sync_cron; }
-reload_service() { sync_cron; }
-boot()           { migrate; sync_cron; }
+# 秒级检测由 procd 托管常驻进程（watchdog-loop），分钟级仍走 cron
+start_service() {
+	local mode iv
+	migrate
+	sync_cron
+	[ "$(uci -q get zzucampusnetagent.config.watchdog)" = "1" ] || return 0
+	set -- $(wd_period); mode=$1; iv=$2
+	[ "$mode" = "s" ] || return 0
+	procd_open_instance watchdog
+	procd_set_param command "$BIN" watchdog-loop "$iv"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
 
 stop_service() {
 	[ -f "$CRON" ] && sed -i -e "\|$TAG|d" -e "\|$TAG_WD|d" "$CRON"
@@ -2096,6 +2237,7 @@ config zzucampusnetagent 'config'
 	option auto_relogin '0'
 	option relogin_time '06:00'
 	option watchdog '0'
+	# 掉线检测间隔：纯数字 = 分钟（cron）；加 s = 秒（如 5s，procd 常驻进程快速探测）
 	option watchdog_interval '5'
 	# 外网检测：认证在线的线路再以该线路 IP 请求 probe_url（须返回 HTTP 204），不通则判定外网不通
 	option probe '1'

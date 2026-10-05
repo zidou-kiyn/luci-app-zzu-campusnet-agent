@@ -3,6 +3,7 @@ config zzucampusnetagent 'config'
 	option auto_relogin '0'
 	option relogin_time '06:00'
 	option watchdog '0'
+	# 掉线检测间隔：纯数字 = 分钟（cron）；加 s = 秒（如 5s，procd 常驻进程快速探测）
 	option watchdog_interval '5'
 	# 外网检测：认证在线的线路再以该线路 IP 请求 probe_url（须返回 HTTP 204），不通则判定外网不通
 	option probe '1'

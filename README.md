@@ -6,7 +6,8 @@
 - 🔑 **一键登录 / 注销**（portal 认证）
 - ⏰ **每天定时重新授权**：到点若在线则先注销、隔 1 秒再登录，保证授权不掉线（默认凌晨 06:00）
 - 🔀 **多线路**：同一账号在不同出口**同时**登录不同运营商（如电信1 + 移动1），每条线路独立显示状态、独立登录/注销
-- 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证
+- 🩺 **掉线自动重登**：定期检查所有线路，发现离线自动重新认证；间隔可设为秒级（如 `5s`，常驻进程快速探测外网）
+- ⏰ **单线路额外重认证**：每条线路可另设每天的重认证时间（如联通线路 00:30），与全局定时互不影响
 - 🌐 **外网连通检测**（默认开启）：认证服务器只记录登录状态，运营商侧会话失效后仍显示“在线”。插件对在线线路再以该线路 IP 访问 `generate_204` 检测地址，不通则显示 **外网不通**（可一键「重新认证」）；看门狗隔 3 秒复测仍不通则自动“注销→登录”
 - 🔀 **故障线路自动摘除**（默认开启，配合多线聚合）：重新认证后仍不通的线路暂时移出聚合路由，新连接不再分到坏线上；连续 2 次检测正常后自动加回；同组全部故障时保留全部
 - 📊 **设备监控**（默认关闭，「设备监控」页开启）：各设备实时速率与每日上传 / 下载流量、访问过的域名；开启流量卸载也准确，几乎不占内存，历史按天压缩存闪存（默认 30 天）
@@ -15,7 +16,7 @@
 
 ## 它有多轻量
 
-- **零新增常驻进程**：抓取逻辑只在被调用时跑（LuCI 轮询 / cron 触发），平时不占内存。
+- **默认零新增常驻进程**：抓取逻辑只在被调用时跑（LuCI 轮询 / cron 触发），平时不占内存；仅当掉线检测间隔设为秒级（如 `5s`）时才由 procd 托管一个 shell 循环。
 - **零额外依赖**：只用系统自带 `uclient-fetch`/`curl`、`jsonfilter`、`jshn`、`awk`、`cron`。
   密码的 base64 与 URL 编码内置纯 `awk` 兜底实现。
 - **磁盘占用 < 30 KB**。
@@ -305,10 +306,12 @@ zzucampusnetagent login [线路]    # 用已保存配置登录
 zzucampusnetagent logout [线路]   # 注销
 zzucampusnetagent reauth [线路]   # “注销→隔1s→登录”；不带参数 = 全部线路
 zzucampusnetagent relogin [线路]  # 同上（单条），输出登录结果 JSON（页面「重新认证」按钮调用）
-zzucampusnetagent watchdog        # 检查全部线路：离线的自动登录；认证在线但外网不通的注销后重登
+zzucampusnetagent watchdog [线路...]  # 检查线路（默认全部）：离线的自动登录；认证在线但外网不通的注销后重登
+zzucampusnetagent watchdog-loop 5 # 常驻快速检测（检查间隔设为 5s 时由 procd 自动启动，无需手动运行）
 zzucampusnetagent migrate         # 手动触发旧版配置迁移（平时每次调用都会自动检查）
 logread | grep zzucampusnetagent    # 看定时重授权日志
-crontab -l                  # 确认定时任务已写入（# zzucampusnetagent-reauth / -watchdog）
+crontab -l                  # 确认定时任务已写入（# zzucampusnetagent-reauth / -reauth-line / -watchdog）
+ubus call service list '{"name":"zzucampusnetagent"}'  # 秒级检测时确认 watchdog-loop 进程在运行
 ```
 
 - `query` 能返回 `"status":"online"` 说明后端正常；页面看不到就 Ctrl+F5 强刷。

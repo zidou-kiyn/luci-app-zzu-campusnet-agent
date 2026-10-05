@@ -473,8 +473,16 @@ return view.extend({
         o.default = '0';
         o.rmempty = false;
 
-        o = s.option(form.Value, 'watchdog_interval', '检查间隔（分钟）', '1–59，默认 5');
-        o.datatype = 'range(1,59)';
+        o = s.option(form.Value, 'watchdog_interval', '检查间隔',
+            '纯数字为分钟（1–59，由 cron 定时执行）；加 s 后缀为秒（2s–59s，常驻进程每隔该秒数探测各线路外网，不通立即处理，另每分钟做一次完整检查）。如 5 或 5s');
+        o.validate = function(id, v) {
+            if (v == null || v === '') return true;
+            var m = /^(\d+)([sS]?)$/.exec(String(v).trim());
+            if (!m) return '格式：分钟数（如 5）或秒数加 s（如 5s）';
+            var n = +m[1];
+            if (m[2]) return (n >= 2 && n <= 59) || '秒级间隔范围 2s–59s';
+            return (n >= 1 && n <= 59) || '分钟间隔范围 1–59';
+        };
         o.placeholder = '5';
         o.default = '5';
         o.depends('watchdog', '1');
@@ -525,6 +533,16 @@ return view.extend({
 
         o = ls.option(form.ListValue, 'isp', '运营商');
         addIsp(o);
+
+        o = ls.option(form.Value, 'reauth_time', '额外重认证',
+            '可选，HH:MM。每天到点单独对该线路注销后重登（与上方全局定时互不影响）');
+        o.placeholder = '如 00:30';
+        o.optional = true;
+        o.rmempty = true;
+        o.validate = function(id, v) {
+            if (v == null || v === '') return true;
+            return /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(v).trim()) || '格式 HH:MM，如 00:30';
+        };
 
         return m.render().then(function(mapEl) {
             poll.add(function() { return self.refresh(); }, 10);
