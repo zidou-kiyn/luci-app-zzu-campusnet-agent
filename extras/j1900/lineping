@@ -1,0 +1,20 @@
+#!/bin/sh
+# 每 30 秒分别从 4 条线路 ping 一次目标（各 5 包），结果写 /var/run/lineping/<线路>：
+#   丢包率(0~1) 平均延迟(ms) 标准差(ms)；线路无 IP 或全丢时延迟记 U
+# 由 lineping-collectd.sh（装到 /usr/libexec/collectd/lineping.sh）送进 collectd，LuCI「统计 → 图表 → Ping」显示
+T=${1:-223.5.5.5}; D=/var/run/lineping
+mkdir -p $D
+while :; do
+	for d in wancm1 wancm2 wanct1 wanct2; do
+		(
+		src=$(ip -4 -o addr show dev $d 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+		if [ -n "$src" ]; then
+			ping -c 5 -W 1 -w 8 -I "$src" "$T" 2>/dev/null
+		fi | awk '/time=/{sub(/.*time=/,""); v=$1+0; c++; s+=v; q+=v*v}
+			END{ if (c) { a=s/c; v=q/c-a*a; if (v<0) v=0; printf "%.2f %.3f %.3f\n", (5-c)/5, a, sqrt(v) }
+			     else print "1 U U" }' > $D/$d.tmp && mv $D/$d.tmp $D/$d
+		) &
+	done
+	wait
+	sleep 22
+done

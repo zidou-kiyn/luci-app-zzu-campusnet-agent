@@ -1,0 +1,40 @@
+services:
+  # 让中转服务器加入同一个 Tailscale 账号，derper 用它的 socket 校验客户端（-verify-clients）
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: ts-derp
+    hostname: hk-derp
+    network_mode: host
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}   # 只有第一次登录需要，之后可从 .env 删掉
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_USERSPACE=true          # 只用来校验客户端，不需要 tun 网卡
+    volumes:
+      - ./ts-state:/var/lib/tailscale
+      - ./ts-sock:/var/run/tailscale
+    restart: unless-stopped
+
+  derper:
+    build: .
+    container_name: derper
+    depends_on: [tailscale]
+    # derper 用 letsencrypt 证书时只在 :443 上启用 TLS，其它端口是明文 HTTP，客户端连不上；
+    # 所以容器里固定监听 443，对外端口靠映射改。
+    ports:
+      - "33445:443"          # 中转（HTTPS）；校园网拦了 443，derpMap 里填这个端口
+      - "443:443"            # 证书续期备用
+      - "80:80"              # Let's Encrypt 申请/续期
+      - "33478:3478/udp"     # STUN；校园网拦了 3478
+    command:
+      - -hostname=${DERP_DOMAIN}
+      - -certmode=letsencrypt
+      - -certdir=/certs
+      - -a=:443
+      - -http-port=80
+      - -stun-port=3478
+      - -verify-clients      # 只放行同一个 Tailscale 账号的设备
+    volumes:
+      - ./certs:/certs
+      - ./ts-sock:/var/run/tailscale
+    restart: unless-stopped

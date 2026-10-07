@@ -1,0 +1,20 @@
+// 粘贴到 Tailscale 后台 → Access controls（JSON editor）最外层的 { 之后，然后 Save
+	"derpMap": {
+		"OmitDefaultRegions": false,   // 保留官方中转作备用
+		"Regions": {
+			"900": {
+				"RegionID":   900,
+				"RegionCode": "hk-self",
+				"RegionName": "Hong Kong (self)",
+				"Nodes": [
+					{
+						"Name":     "900a",
+						"RegionID": 900,
+						"HostName": "derp.example.com",
+						"DERPPort": 33445,
+						"STUNPort": 33478,
+					},
+				],
+			},
+		},
+	},

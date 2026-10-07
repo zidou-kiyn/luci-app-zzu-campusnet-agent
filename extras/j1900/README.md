@@ -33,6 +33,7 @@ Redmi AX5400（纯 AP）
 | 192.168.1.1 | J1900 救援地址（与 31.1 同一网口）。配置出错时电脑手动设 `192.168.1.100/24` 即可登录，**不要删除** |
 | 192.168.31.2 | AX5400 管理地址 |
 | 192.168.31.1:3000 | AdGuard Home |
+| 100.x.x.x | J1900 的 Tailscale 地址（在外面访问路由器） |
 
 ## 文件
 
@@ -47,6 +48,11 @@ Redmi AX5400（纯 AP）
 | `sqm.example` | J1900 | `/etc/config/sqm`：只给电信两线限下载 124M（cake，nat dual-dsthost） |
 | `speedtest.sh` | J1900 | 多线路同时测速：`sh speedtest.sh 10 4 wancm1 wancm2` |
 | `xiaomi-ap.sh` | AX5400 | 改成纯 AP：停用路由类服务、WAN 口并入网桥、VLAN 32、管理地址 31.2 |
+| `data-disk.sh` | J1900 | 系统盘剩余空间分成 ext4 数据分区，挂到 `/mnt/data`（不动现有分区、不重启） |
+| `monitor-setup.sh` | J1900 | 装 vnstat2 + luci-app-statistics，配好每条线路延迟曲线；系统日志改写到硬盘 |
+| `lineping` / `lineping-collectd.sh` | J1900 | 每 30 秒分别从 4 条线路 ping，结果交给 collectd 画在「统计 → 图表 → Ping」里；由 `monitor-setup.sh` 安装 |
+| `tailscale-setup.sh` | J1900 | 装 Tailscale、加防火墙区域，发布两个网段和出口节点 |
+| `derper/` | 香港服务器 | 自建 Tailscale 中转（Docker Compose），校园网端口限制的绕法见 [derper/README.md](derper/README.md) |
 | `irq-pin.sh` | AX5400 | 中断固定：CPU0 = 有线 + 2.4G，CPU1 = 5G。装到 `/usr/sbin/irq-pin.sh`，由 `rc.local` 开机执行 |
 
 ## 部署步骤
@@ -67,6 +73,14 @@ ssh root@<AX5400> 'nohup sh /root/xiaomi-ap.sh &'
 # 3. J1900 装好 AdGuard Home 后
 ssh root@192.168.31.1 sh /root/agh-front.sh
 # SQM：装 luci-app-sqm 后按 sqm.example 写 /etc/config/sqm
+
+# 4. 可选：数据分区 + 监控 + 日志写硬盘
+scp extras/j1900/{data-disk.sh,monitor-setup.sh,lineping,lineping-collectd.sh} root@192.168.31.1:/root/
+ssh root@192.168.31.1 'sh /root/data-disk.sh && sh /root/monitor-setup.sh'
+
+# 5. 可选：Tailscale（会打印登录链接；自建中转见 derper/README.md）
+scp extras/j1900/tailscale-setup.sh root@192.168.31.1:/root/
+ssh root@192.168.31.1 sh /root/tailscale-setup.sh
 ```
 
 AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以在 LuCI → 系统 → 软件包里卸载。
@@ -83,6 +97,11 @@ AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以
 | 防火墙 | 软件 + 硬件流量卸载、FullCone NAT |
 | SQM | 只给电信两线限下载 124M；联通和上传不限速 |
 | irqbalance | 开启 |
+| 数据分区 | 系统盘剩余约 28G → `/mnt/data`（ext4），存日志、vnstat、统计数据 |
+| 系统日志 | 写 `/mnt/data/log/messages`，50MB 轮转一次；cron 例行执行不记日志 |
+| vnstat2 | 4 条线路 + 两个网段，按小时 / 天 / 月统计流量 |
+| luci-app-statistics | CPU、负载、内存、温度、连接数、各接口流量；`lineping` 提供每条线路到 223.5.5.5 的延迟 / 丢包 |
+| Tailscale | 发布 31 / 32 网段 + 出口节点；不接管 DNS、不接收别人的路由；中转用自建香港 DERP |
 
 AX5400 只运行 WiFi / 网桥 / LuCI / SSH / NTP，DHCP、DNS、防火墙都已停用，irqbalance 由 `irq-pin.sh` 代替。
 校园网插件已经卸载，所以它**不能**再直接当路由器用。

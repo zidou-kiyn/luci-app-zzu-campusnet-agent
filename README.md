@@ -84,7 +84,7 @@ uci commit network; /etc/init.d/network reload
 | `/etc/init.d/zzucampusnetagent` | 按配置同步 cron 定时任务（procd reload 触发） |
 | `/etc/config/zzucampusnetagent` | UCI 配置：`config` 段为全局设置（服务器、定时任务）；每个 `line` 段是一条认证线路（name/account/password/iface/isp）。旧版把主线路和共用账号密码存在 `config` 段，升级后自动迁移：主线路 → `line` 段 `main`，共用账号密码 → 填进没有自己账号密码的线路 |
 | `extras/99-multipath` | （不随包安装）组表多路默认路由 hotplug，配合故障线路摘除 |
-| `extras/j1900/` | （不随包安装）实例：J1900 软路由做主路由 + Redmi AX5400 纯 AP 的全套配置脚本，见 [extras/j1900/README.md](extras/j1900/README.md) |
+| `extras/j1900/` | （不随包安装）实例：J1900 软路由做主路由 + Redmi AX5400 纯 AP 的全套配置脚本（含监控、Tailscale 与自建中转），见 [extras/j1900/README.md](extras/j1900/README.md) |
 | `htdocs/.../view/zzucampusnetagent/status.js` | LuCI 前端：状态卡片 + 操作按钮 + 设置表单 |
 | `/usr/sbin/zzunetmon` | 设备监控 CLI：nft 计数钩子、DNS 日志汇总、按天存储与 JSON 输出 |
 | `/etc/init.d/zzunetmon` / `hotplug.d/iface/90-zzunetmon` | 按 `netmon` 配置段启停；LAN 网桥重建后重新挂钩子 |
