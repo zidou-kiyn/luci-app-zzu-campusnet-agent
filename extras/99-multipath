@@ -1,9 +1,10 @@
 #!/bin/sh
-# /etc/hotplug.d/iface/99-multipath（由 quad-wan-setup.sh 安装）
+# /etc/hotplug.d/iface/99-multipath（extras/j1900/j1900-setup.sh 安装）
 # 每条线路有自己的路由表（netifd ip4table，按源 IP 选表，保证源 IP 与出口一致）；
 # 这里只维护两个“组表”的多路默认路由：
-#   电信组 → main  表：wanct1 + wanct2
-#   移动组 → wancm 表：wancm1 + wancm2
+#   联通组 → main  表：wancm1 + wancm2（31 网段、路由器自身）
+#   电信组 → wanct 表：wanct1 + wanct2（32 网段）
+# 换成其它分组时只改文件末尾的 case
 # 各线网关同为校园网网关，组表内没有直连路由，因此 nexthop 用 onlink。
 # 故障摘除：认证插件 watchdog 判定线路外网不通时写 $DOWN/<设备名> 并以 ACTION=ifup 调用本脚本，
 # 有标记的设备不进组路由；组内全部被标记时仍保留全部（有默认路由总比没有好）。
@@ -36,6 +37,6 @@ build() {
 }
 
 case "$INTERFACE" in
-	wanct1|wanct2) build main  wanct1 wanct2 ;;
-	wancm1|wancm2) build wancm wancm1 wancm2 ;;
+	wancm1|wancm2) build main  wancm1 wancm2 ;;
+	wanct1|wanct2) build wanct wanct1 wanct2 ;;
 esac

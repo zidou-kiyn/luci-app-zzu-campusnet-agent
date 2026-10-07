@@ -4,7 +4,9 @@
 #   32 网段 lanct (br-lanct = eth0.32 tag)   → 电信组 (wanct 表) Lyra-2.4G
 #   WAN: eth1 上 4 条 macvlan，MAC 沿用小米
 #   192.168.1.1 保留为 lan 上的管理地址（救援用）
+#   需先把 extras/99-multipath 传到 /root/
 set -e
+[ -f /root/99-multipath ] || { echo '缺少 /root/99-multipath'; exit 1; }
 GW=10.172.255.254
 
 # ── system ──
@@ -94,6 +96,8 @@ uci commit network
 
 # ── firewall ──
 uci set firewall.@defaults[0].flow_offloading='1'
+uci set firewall.@defaults[0].flow_offloading_hw='1'
+uci set firewall.@defaults[0].fullcone='1'
 WZ=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
 uci -q delete "firewall.$WZ.network" || true
 for n in wanct1 wanct2 wancm1 wancm2; do uci add_list "firewall.$WZ.network=$n"; done
@@ -159,40 +163,8 @@ echo "net.ipv4.fib_multipath_hash_policy=1" > /etc/sysctl.d/99-multipath-hash.co
 sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null
 
 # ── 组路由 hotplug：联通组 → main，电信组 → wanct ──
-cat > /etc/hotplug.d/iface/99-multipath <<'HOTPLUG_EOF'
-#!/bin/sh
-# /etc/hotplug.d/iface/99-multipath（J1900 版）
-#   联通组 → main  表：wancm1 + wancm2（31 网段、路由器自身、代理）
-#   电信组 → wanct 表：wanct1 + wanct2（32 网段）
-[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
-GW=10.172.255.254
-DOWN=/var/run/zzucampusnetagent/down
-build() {
-	local tbl="$1" NH="" ALL="" n=0 m=0 x=0 dev ip hop note=""; shift
-	for dev in "$@"; do
-		[ "$ACTION" = "ifdown" ] && [ "$dev" = "$DEVICE" -o "$dev" = "$INTERFACE" ] && continue
-		ip link show "$dev" up >/dev/null 2>&1 || continue
-		ip=$(ip -4 -br addr show dev "$dev" 2>/dev/null | awk '{print $3}')
-		[ -z "$ip" ] && continue
-		hop="nexthop via $GW dev $dev weight 1 onlink"
-		ALL="$ALL $hop"; m=$((m + 1))
-		if [ -e "$DOWN/$dev" ]; then x=$((x + 1)); continue; fi
-		NH="$NH $hop"; n=$((n + 1))
-	done
-	if [ "$n" -eq 0 ] && [ "$m" -gt 0 ]; then
-		NH="$ALL"; n=$m; note=" (all marked down, keep all)"
-	elif [ "$x" -gt 0 ]; then
-		note=", $x removed by failover"
-	fi
-	while ip route del default table "$tbl" 2>/dev/null; do :; done
-	[ "$n" -gt 0 ] && ip route add default table "$tbl" $NH
-	logger -t multipath "$tbl: $n path(s)$note"
-}
-case "$INTERFACE" in
-	wancm1|wancm2) build main  wancm1 wancm2 ;;
-	wanct1|wanct2) build wanct wanct1 wanct2 ;;
-esac
-HOTPLUG_EOF
+# 与 extras/99-multipath 相同，需先一起传到 /root/
+cp /root/99-multipath /etc/hotplug.d/iface/99-multipath
 chmod +x /etc/hotplug.d/iface/99-multipath
 
 # ── 认证插件配置（填好账号密码的 zzucampusnetagent.example 先传到 /tmp/zzucampusnetagent.cfg）──

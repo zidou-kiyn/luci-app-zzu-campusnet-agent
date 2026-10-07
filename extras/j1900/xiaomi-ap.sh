@@ -1,5 +1,6 @@
 #!/bin/sh
-# 小米 AX5400 → 纯 AP（后台运行，日志 /tmp/ap.log）
+# Redmi AX5400 → 纯 AP（后台运行，日志 /tmp/ap.log）
+#   可选：先把 irq-pin.sh 传到 /root/，会装成 /usr/sbin/irq-pin.sh 并开机执行（中断固定，替代 irqbalance）
 #   WAN 口接 J1900：不带 tag = 31 网段 (br-lan)，VLAN 32 = 32 网段 (br-lanct)
 #   Lyra-5G + LAN1-3 → br-lan；Lyra-2.4G → br-lanct；删除 Lyra-CUCC-5G
 #   管理地址 192.168.31.2，网关/DNS 192.168.31.1
@@ -52,6 +53,7 @@ uci set dhcp.lan.ignore='1'
 uci set dhcp.lan.dhcpv4='disabled'
 uci -q delete dhcp.lancm
 uci -q delete dhcp.lancm_dns
+for l in wan wanct1 wanct2 wancm1 wancm2; do uci -q delete dhcp.$l; done
 uci commit dhcp
 
 # ── wireless ──
@@ -60,6 +62,13 @@ uci set wireless.default_radio0.network='lanct'   # Lyra-2.4G → 电信
 uci -q delete wireless.lancm_ap                    # 删除 Lyra-CUCC-5G
 uci commit wireless
 
+# ── 中断固定（AP 只有转发 + WiFi，固定分配比 irqbalance 更稳）──
+if [ -f /root/irq-pin.sh ]; then
+	cp /root/irq-pin.sh /usr/sbin/irq-pin.sh; chmod +x /usr/sbin/irq-pin.sh
+	grep -q irq-pin.sh /etc/rc.local || sed -i '/^exit 0/i /usr/sbin/irq-pin.sh' /etc/rc.local
+	[ -x /etc/init.d/irqbalance ] && { /etc/init.d/irqbalance stop; /etc/init.d/irqbalance disable; }
+fi
+
 # ── 应用 ──
 /etc/init.d/network stop
 for d in wanct1 wanct2 wancm1 wancm2; do ip link del "$d" 2>/dev/null; done
@@ -67,4 +76,5 @@ ip addr flush dev wan 2>/dev/null
 /etc/init.d/network start
 sleep 5
 wifi reload
+[ -x /usr/sbin/irq-pin.sh ] && /usr/sbin/irq-pin.sh
 echo AP_DONE
