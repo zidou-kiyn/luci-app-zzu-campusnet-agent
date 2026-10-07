@@ -101,7 +101,7 @@ AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以
 | 系统日志 | 写 `/mnt/data/log/messages`，50MB 轮转一次；cron 例行执行不记日志 |
 | vnstat2 | 4 条线路 + 两个网段，按小时 / 天 / 月统计流量 |
 | luci-app-statistics | CPU、负载、内存、温度、连接数、各接口流量；`lineping` 提供每条线路到 223.5.5.5 的延迟 / 丢包 |
-| Tailscale | 发布 31 / 32 网段 + 出口节点；不接管 DNS、不接收别人的路由；中转用自建香港 DERP |
+| Tailscale | 发布 31 / 32 网段、校园内网 172.16.0.0/16 + 出口节点；不接管 DNS、不接收别人的路由；中转用自建香港 DERP |
 
 AX5400 只运行 WiFi / 网桥 / LuCI / SSH / NTP，DHCP、DNS、防火墙都已停用，irqbalance 由 `irq-pin.sh` 代替。
 校园网插件已经卸载，所以它**不能**再直接当路由器用。
