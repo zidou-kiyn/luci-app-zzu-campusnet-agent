@@ -5,6 +5,7 @@
 #     Edit route settings：勾选所有网段和 Use as exit node；Disable key expiry
 #   172.16.0.0/16 = 校园内网（认证页 172.16.4.14 等）。手机走出口节点时私有地址可能不进隧道，
 #   单独发布成网段路由才稳；不用出口节点也能访问
+#   10.67.4.89/32 = 校内 OJ。只发单个地址：整个 10/8 会和手机运营商的内网地址冲突
 #   国内直连官方中转很慢，自建中转见 derper/README.md
 set -e
 apk add -q tailscale
@@ -32,7 +33,7 @@ sleep 3
 
 # 不接管 DNS（路由器用自己的 AGH），不接收别人发布的网段（避免影响策略路由）
 tailscale up --hostname=j1900 \
-	--advertise-routes=192.168.31.0/24,192.168.32.0/24,172.16.0.0/16 \
+	--advertise-routes=192.168.31.0/24,192.168.32.0/24,172.16.0.0/16,10.67.4.89/32 \
 	--advertise-exit-node \
 	--accept-dns=false --accept-routes=false
 tailscale status

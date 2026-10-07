@@ -1,0 +1,42 @@
+# 国内服务器（已备案）版：80/443 被反向代理（如 Nginx Proxy Manager）占用时用。
+# 证书用反向代理申请好的（通配符也行），derper 用 manual 模式直接在 33445 上提供 HTTPS。
+#   certs/<域名>.crt → fullchain.pem、certs/<域名>.key → privkey.pem 用软链接指过去（见 README）
+#   manual 模式只在启动时读证书：要每周重启一次，读到续期后的新证书
+# 用法：docker compose -f docker-compose.manual-cert.yml up -d
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: ts-derp
+    hostname: cn-derp
+    network_mode: host
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_USERSPACE=true
+    volumes:
+      - ./ts-state:/var/lib/tailscale
+      - ./ts-sock:/var/run/tailscale
+    restart: unless-stopped
+
+  derper:
+    image: derper-derper:latest      # 国内拉不动 Docker Hub / Go 依赖：在海外服务器构建后导入（见 README）
+    container_name: derper
+    depends_on: [tailscale]
+    ports:
+      - "33445:33445"                # 中转（HTTPS）
+      - "33478:3478/udp"             # STUN
+    command:
+      - -hostname=${DERP_DOMAIN}
+      - -certmode=manual
+      - -certdir=/certs
+      - -a=:33445
+      - -http-port=-1
+      - -stun-port=3478
+      - -verify-clients
+    volumes:
+      - ./certs:/certs:ro
+      # 反向代理的 letsencrypt 目录，容器内外路径保持一致，软链接在主机上也能直接验证
+      - /path/to/npm/letsencrypt:/path/to/npm/letsencrypt:ro
+      - ./ts-sock:/var/run/tailscale
+    restart: unless-stopped

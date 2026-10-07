@@ -1,4 +1,5 @@
 // 粘贴到 Tailscale 后台 → Access controls（JSON editor）最外层的 { 之后，然后 Save
+// 每台设备会自动选延迟最低的区域作为自己的中转；其余区域作备用
 	"derpMap": {
 		"OmitDefaultRegions": false,   // 保留官方中转作备用
 		"Regions": {
@@ -11,6 +12,21 @@
 						"Name":     "900a",
 						"RegionID": 900,
 						"HostName": "derp.example.com",
+						"DERPPort": 33445,
+						"STUNPort": 33478,
+					},
+				],
+			},
+			"901": {
+				"RegionID":   901,
+				"RegionCode": "cn-self",
+				"RegionName": "China (self)",
+				// "Avoid": true,   // 取消注释 = 所有设备都不把它选为自己的中转（想强制走 900 时用）
+				"Nodes": [
+					{
+						"Name":     "901a",
+						"RegionID": 901,
+						"HostName": "derp-cn.example.com",
 						"DERPPort": 33445,
 						"STUNPort": 33478,
 					},

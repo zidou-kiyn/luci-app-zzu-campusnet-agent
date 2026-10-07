@@ -52,7 +52,7 @@ Redmi AX5400（纯 AP）
 | `monitor-setup.sh` | J1900 | 装 vnstat2 + luci-app-statistics，配好每条线路延迟曲线；系统日志改写到硬盘 |
 | `lineping` / `lineping-collectd.sh` | J1900 | 每 30 秒分别从 4 条线路 ping，结果交给 collectd 画在「统计 → 图表 → Ping」里；由 `monitor-setup.sh` 安装 |
 | `tailscale-setup.sh` | J1900 | 装 Tailscale、加防火墙区域，发布两个网段和出口节点 |
-| `derper/` | 香港服务器 | 自建 Tailscale 中转（Docker Compose），校园网端口限制的绕法见 [derper/README.md](derper/README.md) |
+| `derper/` | 香港 / 国内服务器 | 自建 Tailscale 中转（Docker Compose，香港用 Let's Encrypt、国内用已有证书），校园网端口限制的绕法见 [derper/README.md](derper/README.md) |
 | `irq-pin.sh` | AX5400 | 中断固定：CPU0 = 有线 + 2.4G，CPU1 = 5G。装到 `/usr/sbin/irq-pin.sh`，由 `rc.local` 开机执行 |
 
 ## 部署步骤
@@ -101,7 +101,7 @@ AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以
 | 系统日志 | 写 `/mnt/data/log/messages`，50MB 轮转一次；cron 例行执行不记日志 |
 | vnstat2 | 4 条线路 + 两个网段，按小时 / 天 / 月统计流量 |
 | luci-app-statistics | CPU、负载、内存、温度、连接数、各接口流量；`lineping` 提供每条线路到 223.5.5.5 的延迟 / 丢包 |
-| Tailscale | 发布 31 / 32 网段、校园内网 172.16.0.0/16 + 出口节点；不接管 DNS、不接收别人的路由；中转用自建香港 DERP |
+| Tailscale | 发布 31 / 32 网段、校园内网 172.16.0.0/16、校内 OJ 10.67.4.89 + 出口节点；不接管 DNS、不接收别人的路由；中转用自建香港 + 国内 DERP（见 derper/） |
 
 AX5400 只运行 WiFi / 网桥 / LuCI / SSH / NTP，DHCP、DNS、防火墙都已停用，irqbalance 由 `irq-pin.sh` 代替。
 校园网插件已经卸载，所以它**不能**再直接当路由器用。
