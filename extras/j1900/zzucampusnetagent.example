@@ -1,0 +1,54 @@
+
+# J1900 四线认证配置示例：填好账号密码后传到路由器 /tmp/zzucampusnetagent.cfg，
+# 再运行 j1900-setup.sh（会拷到 /etc/config/zzucampusnetagent）
+# 同一账号可在不同线路上登录不同运营商；电信2 可用另一个账号
+
+config zzucampusnetagent 'config'
+	option baseurl '172.16.4.14'
+	option auto_relogin '1'
+	option relogin_time '06:00'
+	option watchdog '1'
+	option watchdog_interval '5s'
+	option probe '1'
+	option failover '1'
+
+config line 'main'
+	option enabled '1'
+	option name '电信1'
+	option iface 'wanct1'
+	option isp 'telecom'
+	option account '<学号A>'
+	option password '<密码A>'
+
+config line 'wanct2'
+	option enabled '1'
+	option name '电信2'
+	option iface 'wanct2'
+	option isp 'telecom'
+	option account '<学号B>'
+	option password '<密码B>'
+
+config line 'wancm1'
+	option enabled '1'
+	option name '联通1'
+	option iface 'wancm1'
+	option isp 'unicom'
+	option account '<学号A>'
+	option password '<密码A>'
+	option reauth_time '00:30'
+
+config line 'wancm2'
+	option enabled '1'
+	option name '联通2'
+	option iface 'wancm2'
+	option isp 'unicom'
+	option account '<学号A>'
+	option password '<密码A>'
+	option reauth_time '00:30'
+
+config netmon 'netmon'
+	option enabled '1'
+	option dns '1'
+	option retention '30'
+	list iface 'lan'
+	list iface 'lanct'

@@ -172,6 +172,7 @@ uci commit network; /etc/init.d/network reload
 | `extras/dual-isp-setup.sh` | （不随包安装）双运营商分流一键配置脚本 |
 | `extras/dual-isp-sqm.sh` | （不随包安装）主线路改 macvlan + 分线路 SQM |
 | `extras/quad-wan-setup.sh` / `99-multipath` | （不随包安装）四线聚合 + 组表多路默认路由 hotplug |
+| `extras/j1900/` | （不随包安装）实例：J1900 软路由做主路由 + 小米 AX5400 纯 AP 的全套配置脚本，见 [extras/j1900/README.md](extras/j1900/README.md) |
 | `htdocs/.../view/zzucampusnetagent/status.js` | LuCI 前端：状态卡片 + 操作按钮 + 设置表单 |
 | `/usr/sbin/zzunetmon` | 设备监控 CLI：nft 计数钩子、DNS 日志汇总、按天存储与 JSON 输出 |
 | `/etc/init.d/zzunetmon` / `hotplug.d/iface/90-zzunetmon` | 按 `netmon` 配置段启停；LAN 网桥重建后重新挂钩子 |
