@@ -996,6 +996,8 @@ cat > "$BIN" <<'ZZU_EOF_BIN'
 # 故障摘除（config.failover，默认开启，需外网检测）：watchdog 处理完毕后线路仍不通，
 # 写标记 $DOWN_DIR/<设备名> 并调用 99-multipath 重建组路由（该脚本跳过有标记的设备）。
 # 被摘除的线路仍以自己的源 IP 走自己的路由表，照常检测；连续 FO_RECOVER 次正常后恢复。
+# 已禁用线路的接口同样摘除（不认证必然不通）；某组线路全部摘除时，99-multipath 借用其它组的
+# 可用线路兜底（如联通全挂 → 31 网段临时走电信），本组恢复后自动切回。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
@@ -1054,10 +1056,13 @@ migrate() {
 	) 8>"$MLOCK"
 }
 
+# 列出全部线路（含已禁用，按 UCI 中的顺序）
+all_line_ids() { uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"; }
+
 # 列出全部已启用线路（按 UCI 中的顺序）
 line_ids() {
 	local id
-	for id in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+	for id in $(all_line_ids); do
 		[ "$(uci -q get "${CFG}.${id}.enabled" 2>/dev/null)" = "0" ] && continue
 		echo "$id"
 	done
@@ -1162,11 +1167,46 @@ PROBE_URLS_DEFAULT="http://connect.rom.miui.com/generate_204 http://connectivity
 probe_on() { [ "$(cfg probe)" != "0" ]; }
 probe_urls() { local u; u=$(cfg probe_url); echo "${u:-$PROBE_URLS_DEFAULT}"; }
 
+# 探测地址的 DNS 缓存（每行 "主机 端口 IP"）：探测时用 curl --resolve 直连缓存的 IP。
+# 路由器自身的 DNS 走主表（某一组线路），若每次探测都现查 DNS，那组线路一抖动，
+# 所有线路的探测都会因解析超时被判为不通、连带被重登；缓存后各线路只检测自己的出口。
+# 缓存超过 PROBE_DNS_TTL 分钟才重新解析；解析失败保留旧记录（无缓存时退回现查 DNS）
+PROBE_DNS="/var/run/zzucampusnetagent/probe_dns"
+PROBE_DNS_TTL=10
+
+# 解析为第一个 IPv4（BusyBox nslookup 输出中 Name: 之后的 Address 行）
+resolve4() {
+	nslookup "$1" 2>/dev/null | awk '/^Name:/{n=1} n && /^Address/{sub(/^Address[ 0-9]*: */,""); if ($1 ~ /^[0-9.]+$/) {print $1; exit}}'
+}
+
+probe_dns_refresh() {
+	local u h p ip tmp
+	mkdir -p "${PROBE_DNS%/*}"
+	tmp="$PROBE_DNS.$$"
+	: > "$tmp"
+	for u in $(probe_urls); do
+		h=${u#*://}; h=${h%%/*}
+		case "$h" in *:*) p=${h##*:}; h=${h%%:*} ;; *) case "$u" in https:*) p=443 ;; *) p=80 ;; esac ;; esac
+		case "$h" in "") continue ;; *[!0-9.]*) ;; *) continue ;; esac
+		ip=$(resolve4 "$h")
+		[ -n "$ip" ] || ip=$(awk -v h="$h" -v p="$p" '$1==h && $2==p {print $3; exit}' "$PROBE_DNS" 2>/dev/null)
+		[ -n "$ip" ] && echo "$h $p $ip" >> "$tmp"
+	done
+	mv -f "$tmp" "$PROBE_DNS"
+}
+
+# 缓存缺失或过期时刷新（并行探测时可能同时刷新，mv 原子替换，无妨）
+probe_dns_fresh() {
+	[ -s "$PROBE_DNS" ] && [ -n "$(find "$PROBE_DNS" -mmin -"$PROBE_DNS_TTL" 2>/dev/null)" ] && return 0
+	probe_dns_refresh
+}
+
 # 单次探测：输出 "HTTP状态码 curl退出码"。正常约 50ms，连接超时 2s 已留足余量
 probe_one() {
-	local c
+	local c r
+	r=$(awk '{print "--resolve " $1 ":" $2 ":" $3}' "$PROBE_DNS" 2>/dev/null)
 	c=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
-		${2:+--interface "$2"} "$1" 2>/dev/null)
+		$r ${2:+--interface "$2"} "$1" 2>/dev/null)
 	echo "${c:-000} $?"
 }
 
@@ -1181,6 +1221,7 @@ probe_judge() {
 probe_net() {
 	local u
 	command -v curl >/dev/null 2>&1 || return 2
+	probe_dns_fresh
 	for u in $(probe_urls); do probe_one "$u" "$1" & done | probe_judge
 }
 
@@ -1271,22 +1312,39 @@ fo_ok() {
 	mp_rebuild "$d"
 }
 
-# 清理失效标记：功能已关闭、线路已删除/禁用、线路换了接口
+# 已禁用线路的接口：不认证，外网必然不通 → 同样摘除（多路脚本可借此做组间兜底）；
+# 接口同时被已启用线路使用时不动。重新启用后由 watchdog 按健康检测（fo_ok）加回
+fo_disabled() {
+	local id d en
+	failover_on || return 0
+	en=" "; for id in $(line_ids); do en="$en$(fo_dev "$id") "; done
+	for id in $(all_line_ids); do
+		[ "$(lget "$id" enabled)" = "0" ] || continue
+		d=$(fo_dev "$id"); [ -n "$d" ] || continue
+		case "$en" in *" $d "*) continue ;; esac
+		[ -f "$DOWN_DIR/$d" ] && continue
+		mkdir -p "$DOWN_DIR"
+		echo "$id 0" > "$DOWN_DIR/$d"
+		logger -t "$TAG" "failover: [$id] $d removed from multipath (line disabled)"
+		mp_rebuild "$d"
+	done
+}
+
+# 清理失效标记：功能已关闭、线路已删除、线路换了接口（禁用线路的标记保留，见 fo_disabled）
 fo_gc() {
 	local f id d
-	[ -d "$DOWN_DIR" ] || return 0
-	for f in "$DOWN_DIR"/*; do
+	if [ -d "$DOWN_DIR" ]; then for f in "$DOWN_DIR"/*; do
 		[ -f "$f" ] || continue
 		d="${f##*/}"; id=""
 		read -r id _ < "$f"
-		if failover_on && line_exists "$id" && [ "$(lget "$id" enabled)" != "0" ] &&
-		   [ "$(fo_dev "$id")" = "$d" ]; then
+		if failover_on && line_exists "$id" && [ "$(fo_dev "$id")" = "$d" ]; then
 			continue
 		fi
 		rm -f "$f"
 		logger -t "$TAG" "failover: stale marker for $d cleared"
 		mp_rebuild "$d"
-	done
+	done; fi
+	fo_disabled
 }
 
 # 向当前 json 对象写入线路查询结果字段
@@ -1543,6 +1601,7 @@ cmd_wdloop() {
 			"$self" watchdog >/dev/null 2>&1
 			last=$(date +%s)
 		elif probe_on; then
+			probe_dns_fresh
 			bad=$(for id in $(line_ids); do
 				eval "h=\${HOLD_$id:-0}"
 				[ "$now" -lt "$h" ] && continue
