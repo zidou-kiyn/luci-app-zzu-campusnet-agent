@@ -89,7 +89,7 @@ AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以
 
 | 服务 | 说明 |
 |---|---|
-| 校园网插件 | 4 线认证、5 秒看门狗、外网检测、故障线路摘除；06:00 全部重认证，00:30 联通两线额外重认证；设备监控（lan + lanct，保留 30 天） |
+| 校园网插件 | 4 线认证、5 秒看门狗、外网检测、故障线路摘除；06:00 全部重认证；设备监控（lan + lanct，保留 30 天） |
 | 多线聚合 | `/etc/hotplug.d/iface/99-multipath`，按连接哈希（`fib_multipath_hash_policy=1`） |
 | AdGuard Home | 监听 :53，上游阿里 / 腾讯 DoH + DoT，`.lan` 和反查交给 `127.0.0.1:54`；规则 AdGuard DNS filter + anti-AD |
 | dnsmasq | 端口 **54**，只做 DHCP 和 `.lan` 本地解析；**`dns_redirect` 必须为 0**（否则查询被劫持到 54，返回 REFUSED） |
