@@ -7,7 +7,6 @@
 #   需先把 extras/99-multipath 传到 /root/
 set -e
 [ -f /root/99-multipath ] || { echo '缺少 /root/99-multipath'; exit 1; }
-GW=10.172.255.254
 
 # ── system ──
 uci set system.@system[0].hostname='Lyra'
