@@ -4,7 +4,8 @@
 # 这里只维护“组表”的多路默认路由，分组见文件末尾 GROUPS（换分组只改那里）：
 #   联通组 → main  表：wancm1 + wancm2（31 网段、路由器自身）
 #   电信组 → wanct 表：wanct1 + wanct2（32 网段）
-# 各线网关同为校园网网关，组表内没有直连路由，因此 nexthop 用 onlink。
+# 各线路网关自动取自该线路的默认路由（netifd 写在线路自己的表里），无需配置；
+# 组表内没有直连路由，因此 nexthop 用 onlink。
 # 故障摘除：认证插件 watchdog 判定线路外网不通（或线路被停用）时写 $DOWN/<设备名>，
 # 并以 ACTION=ifup 调用本脚本；有标记的设备不进组路由。
 # 组间兜底：某组没有可用线路时借用其它组的可用线路（如联通全挂 → 31 网段临时走电信），
@@ -12,15 +13,24 @@
 # 借用关系取决于其它组的状态，因此任一线路变化都重建全部组。
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
 
-GW=10.172.255.254
+. /lib/functions/network.sh
 DOWN=/var/run/zzucampusnetagent/down
+
+# 设备的 IPv4 网关：优先取 netifd 写入的默认路由（任意表；跳过本脚本建的多路路由），
+# 取不到时按同名逻辑接口查询
+gw() {
+	local g
+	g=$(ip -4 route show table all default dev "$1" 2>/dev/null | awk '$1=="default" && $2=="via" {print $3; exit}')
+	[ -n "$g" ] || network_get_gateway g "$1" 2>/dev/null
+	echo "$g"
+}
 
 # 设备是否可用于路由：已 up、有 IPv4，且不是正在 ifdown 的那个
 # （ifdown 时设备可能还带着 IP，须显式排除；否则多路路由含该设备，设备随后被删除时内核会连同整条路由一起删掉）
 usable() {
 	[ "$ACTION" = "ifdown" ] && [ "$1" = "$DEVICE" -o "$1" = "$INTERFACE" ] && return 1
 	ip link show "$1" up >/dev/null 2>&1 || return 1
-	[ -n "$(ip -4 -br addr show dev "$1" 2>/dev/null | awk '{print $3}')" ]
+	[ -n "$(ip -4 -br addr show dev "$1" 2>/dev/null | awk '{print $3}')" ] && [ -n "$(gw "$1")" ]
 }
 
 # healthy 设备列表…：输出其中可用且未被摘除的设备
@@ -31,7 +41,7 @@ healthy() {
 
 hops() {
 	local d
-	for d in "$@"; do printf ' nexthop via %s dev %s weight 1 onlink' "$GW" "$d"; done
+	for d in "$@"; do printf ' nexthop via %s dev %s weight 1 onlink' "$(gw "$d")" "$d"; done
 }
 
 # build 表名 本组设备…：其它组的设备取自全局 GROUPS
