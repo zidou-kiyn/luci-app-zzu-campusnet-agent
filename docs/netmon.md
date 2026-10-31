@@ -15,7 +15,7 @@ LuCI → 服务 → ZZU CampusNet Agent → **设备监控**：勾选「启用�
 
 ## 配置
 
-`/etc/config/zzucampusnetagent` 的 `netmon` 段：`enabled`、`dns`（是否记录访问域名）、`retention`（保留天数）、`iface`（监控的局域网接口，list）。
+`/etc/config/zzucampusnetagent` 的 `netmon` 段：`enabled`、`dns`（是否记录访问域名）、`retention`（保留天数）、`iface`（监控的局域网接口，list）、`alias`（设备别名，list，格式 `MAC=名称`，页面里设置）。
 
 ## 命令
 

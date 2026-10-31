@@ -49,7 +49,9 @@ ssh root@192.168.1.1 'sh /tmp/install.sh'
 ```sh
 chmod +x /usr/sbin/zzucampusnetagent /usr/sbin/zzunetmon /usr/libexec/rpcd/luci.zzucampusnetagent \
          /etc/init.d/zzucampusnetagent /etc/init.d/zzunetmon
+sh /tmp/40_luci-zzucampusnetagent   # 先把 root/etc/uci-defaults/ 下的这个文件传到 /tmp：迁移旧配置、补设备监控配置段
 /etc/init.d/zzucampusnetagent enable; /etc/init.d/zzucampusnetagent restart
+/etc/init.d/zzunetmon enable; /etc/init.d/zzunetmon restart
 /etc/init.d/rpcd restart
 rm -f /tmp/luci-indexcache*; rm -rf /tmp/luci-modulecache
 ```
