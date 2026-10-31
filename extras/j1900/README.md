@@ -40,7 +40,7 @@ Redmi AX5400（纯 AP）
 | 文件 | 运行位置 | 作用 |
 |---|---|---|
 | `j1900-setup.sh` | J1900 | 写入全部配置（网段、VLAN、4 条 macvlan 线路、策略路由、防火墙、DHCP、sysctl、`99-multipath`、插件配置），不立即生效 |
-| `../99-multipath` | J1900 | 组表多路默认路由 hotplug（联通组 → main，电信组 → wanct），由 `j1900-setup.sh` 装到 `/etc/hotplug.d/iface/` |
+| `../99-multipath` | J1900 | 组表多路默认路由 hotplug（联通组 → main，电信组 → wanct；一组全挂时借用另一组，恢复后切回），由 `j1900-setup.sh` 装到 `/etc/hotplug.d/iface/` |
 | `j1900-apply.sh` | J1900 | 后台应用上面的配置，等 4 条线路拿到 IP 后重启防火墙 / DNS / 插件（日志 `/tmp/apply.log`） |
 | `j1900-dhcp-on.sh` | J1900 | 切换时延时 20 秒打开 31 网段 DHCP（等 AX5400 先变成 AP） |
 | `zzucampusnetagent.example` | J1900 | 插件配置示例（4 线），填好后传到 `/tmp/zzucampusnetagent.cfg` |

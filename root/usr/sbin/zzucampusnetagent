@@ -26,6 +26,8 @@
 # 故障摘除（config.failover，默认开启，需外网检测）：watchdog 处理完毕后线路仍不通，
 # 写标记 $DOWN_DIR/<设备名> 并调用 99-multipath 重建组路由（该脚本跳过有标记的设备）。
 # 被摘除的线路仍以自己的源 IP 走自己的路由表，照常检测；连续 FO_RECOVER 次正常后恢复。
+# 已禁用线路的接口同样摘除（不认证必然不通）；某组线路全部摘除时，99-multipath 借用其它组的
+# 可用线路兜底（如联通全挂 → 31 网段临时走电信），本组恢复后自动切回。
 . /usr/share/libubox/jshn.sh
 . /lib/functions/network.sh
 
@@ -84,10 +86,13 @@ migrate() {
 	) 8>"$MLOCK"
 }
 
+# 列出全部线路（含已禁用，按 UCI 中的顺序）
+all_line_ids() { uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"; }
+
 # 列出全部已启用线路（按 UCI 中的顺序）
 line_ids() {
 	local id
-	for id in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^${CFG}\.\([A-Za-z0-9_]*\)=line\$/\1/p"); do
+	for id in $(all_line_ids); do
 		[ "$(uci -q get "${CFG}.${id}.enabled" 2>/dev/null)" = "0" ] && continue
 		echo "$id"
 	done
@@ -301,22 +306,39 @@ fo_ok() {
 	mp_rebuild "$d"
 }
 
-# 清理失效标记：功能已关闭、线路已删除/禁用、线路换了接口
+# 已禁用线路的接口：不认证，外网必然不通 → 同样摘除（多路脚本可借此做组间兜底）；
+# 接口同时被已启用线路使用时不动。重新启用后由 watchdog 按健康检测（fo_ok）加回
+fo_disabled() {
+	local id d en
+	failover_on || return 0
+	en=" "; for id in $(line_ids); do en="$en$(fo_dev "$id") "; done
+	for id in $(all_line_ids); do
+		[ "$(lget "$id" enabled)" = "0" ] || continue
+		d=$(fo_dev "$id"); [ -n "$d" ] || continue
+		case "$en" in *" $d "*) continue ;; esac
+		[ -f "$DOWN_DIR/$d" ] && continue
+		mkdir -p "$DOWN_DIR"
+		echo "$id 0" > "$DOWN_DIR/$d"
+		logger -t "$TAG" "failover: [$id] $d removed from multipath (line disabled)"
+		mp_rebuild "$d"
+	done
+}
+
+# 清理失效标记：功能已关闭、线路已删除、线路换了接口（禁用线路的标记保留，见 fo_disabled）
 fo_gc() {
 	local f id d
-	[ -d "$DOWN_DIR" ] || return 0
-	for f in "$DOWN_DIR"/*; do
+	if [ -d "$DOWN_DIR" ]; then for f in "$DOWN_DIR"/*; do
 		[ -f "$f" ] || continue
 		d="${f##*/}"; id=""
 		read -r id _ < "$f"
-		if failover_on && line_exists "$id" && [ "$(lget "$id" enabled)" != "0" ] &&
-		   [ "$(fo_dev "$id")" = "$d" ]; then
+		if failover_on && line_exists "$id" && [ "$(fo_dev "$id")" = "$d" ]; then
 			continue
 		fi
 		rm -f "$f"
 		logger -t "$TAG" "failover: stale marker for $d cleared"
 		mp_rebuild "$d"
-	done
+	done; fi
+	fo_disabled
 }
 
 # 向当前 json 对象写入线路查询结果字段
