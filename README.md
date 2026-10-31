@@ -40,6 +40,10 @@ opkg install /tmp/luci-app-zzu-campusnet-agent_*_all.ipk            # ImmortalWr
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 命令行自检与常见问题 |
 | [extras/j1900/](extras/j1900/README.md) | 完整部署实例：J1900 软路由 + Redmi AX5400 AP，4 线聚合 |
 
+## 开发
+
+`install.sh` 内嵌了 `root/` 与 `htdocs/` 下的全部程序文件。改动这些文件后运行 `python scripts/sync_install.py write` 重新生成，并一起提交。推送 `v*` 标签后由 GitHub Actions 编译 ipk / apk 并发布 Release。
+
 ## 安全
 
 密码以明文存于 `/etc/config/zzucampusnetagent`（与多数 LuCI 应用一致，仅 root 可读），只在路由器内部使用，不经过浏览器。请勿外传该配置文件。
