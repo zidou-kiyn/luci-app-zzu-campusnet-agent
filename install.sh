@@ -1540,28 +1540,35 @@ cmd_logout() {
 	json_dump
 }
 
+# 登录/注销结果 JSON → 日志文字：ok / failed (服务器返回的信息)
+res_log() {
+	if [ "$(jsonfilter -s "$1" -e '@.result' 2>/dev/null)" = "1" ]; then echo "ok"
+	else echo "failed ($(jsonfilter -s "$1" -e '@.msg' 2>/dev/null))"; fi
+}
+
 reauth_one() {
-	local id="$1" st
+	local id="$1" st lo=""
 	st=$(query_state "$id")
 	if [ "$st" = "online" ]; then
-		cmd_logout "$id" >/dev/null 2>&1
+		lo="logout $(res_log "$(cmd_logout "$id")"), "
 		sleep 1
 	fi
-	cmd_login "$id" >/dev/null 2>&1
-	logger -t "$TAG" "re-auth [$id] finished (was: $st, now: $(line_state "$id"))"
+	lo="${lo}login $(res_log "$(cmd_login "$id")")"
+	logger -t "$TAG" "re-auth [$id]: $lo (was: $st, now: $(line_state "$id"))"
 }
 
 # 页面「重新认证」：注销（若在线）→ 隔 1s → 登录，输出登录结果 JSON
 cmd_relogin() {
-	local id="$1"
+	local id="$1" lo="" out
 	line_exists "$id" || { bad_line "$id"; return; }
 	exec 9>"$LOCK"; lock_fd
 	if [ "$(query_state "$id")" = "online" ]; then
-		cmd_logout "$id" >/dev/null 2>&1
+		lo="logout $(res_log "$(cmd_logout "$id")"), "
 		sleep 1
 	fi
-	logger -t "$TAG" "manual re-auth [$id]"
-	cmd_login "$id"
+	out=$(cmd_login "$id")
+	logger -t "$TAG" "manual re-auth [$id]: ${lo}login $(res_log "$out")"
+	echo "$out"
 }
 
 cmd_reauth() {
@@ -1595,8 +1602,8 @@ cmd_watchdog() {
 		st=$(query_state "$id")
 		case "$st" in
 		offline)
-			cmd_login "$id" >/dev/null 2>&1
-			logger -t "$TAG" "watchdog: [$id] was offline, relogin -> $(line_state "$id")"
+			st=$(res_log "$(cmd_login "$id")")
+			logger -t "$TAG" "watchdog: [$id] was offline, login $st -> $(line_state "$id")"
 			;;
 		online)
 			if probe_on && resolve_bind "$id" &&
