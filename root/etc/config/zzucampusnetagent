@@ -1,5 +1,6 @@
 config zzucampusnetagent 'config'
-	option baseurl '172.16.4.14'
+	# 认证服务器：荷园/柳园 portal1.zzu.edu.cn，松园 portal2.zzu.edu.cn
+	option baseurl 'portal1.zzu.edu.cn'
 	option auto_relogin '0'
 	option relogin_time '06:00'
 	option watchdog '0'

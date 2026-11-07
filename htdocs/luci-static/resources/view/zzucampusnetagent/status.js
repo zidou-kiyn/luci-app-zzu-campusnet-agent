@@ -454,9 +454,12 @@ return view.extend({
         var s = m.section(form.NamedSection, 'config', 'zzucampusnetagent');
         var o;
 
-        o = s.option(form.Value, 'baseurl', '服务器地址 (Base URL)', '认证服务器地址，默认 172.16.4.14，无需带 http:// 与端口');
-        o.placeholder = '172.16.4.14';
-        o.default = '172.16.4.14';
+        o = s.option(form.Value, 'baseurl', '服务器地址 (Base URL)',
+            '按校区选择认证服务器，也可填写其它域名或 IP（可直接粘贴浏览器里认证页的地址；接口走 HTTPS，默认端口 802）');
+        o.value('portal1.zzu.edu.cn', '荷园 / 柳园（portal1.zzu.edu.cn）');
+        o.value('portal2.zzu.edu.cn', '松园（portal2.zzu.edu.cn）');
+        o.placeholder = 'portal1.zzu.edu.cn';
+        o.default = 'portal1.zzu.edu.cn';
 
         o = s.option(form.Flag, 'auto_relogin', '每天定时重新授权',
             '到点对所有线路执行：若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');

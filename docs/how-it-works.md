@@ -6,9 +6,11 @@
 
 | 动作 | 请求 |
 |------|------|
-| 查询 | `http://<baseurl>:801/eportal/portal/custom` |
-| 登录 | `http://<baseurl>:801/eportal/portal/login?user_account=,0,<账号><运营商后缀>&user_password=<base64 后再 URL 编码的密码>` |
-| 注销 | `http://<baseurl>:801/eportal/portal/logout` |
+| 查询 | `https://<baseurl>:802/eportal/portal/custom` |
+| 登录 | `https://<baseurl>:802/eportal/portal/login?user_account=,0,<账号><运营商后缀>&user_password=<base64 后再 URL 编码的密码>` |
+| 注销 | `https://<baseurl>:802/eportal/portal/logout` |
+
+认证服务器按校区区分：荷园、柳园为 `portal1.zzu.edu.cn`，松园为 `portal2.zzu.edu.cn`。这些域名只有校园网 DNS 能解析，而路由器常改用公共 DNS，所以插件先向各接口 DHCP 下发（含因 `peerdns=0` 未启用）的 DNS 查询，再退回系统 DNS，结果缓存 10 分钟，请求时用 `curl --resolve` 直连。不校验证书：开机时钟未同步时校验会失败，导致无法认证。
 
 运营商后缀：移动 `@cmcc`、联通 `@unicom`、电信 `@telecom`、学科专网 `@zzuplan`，校园网不加后缀。
 
@@ -61,7 +63,7 @@
 
 | 选项 | 说明 |
 |------|------|
-| `baseurl` | 认证服务器地址，默认 `172.16.4.14` |
+| `baseurl` | 认证服务器域名或 IP，默认 `portal1.zzu.edu.cn`；可带端口（默认 802），带 `https://` 与路径也行，只取主机部分 |
 | `auto_relogin` / `relogin_time` | 每天定时重新授权的开关与时间（`HH:MM`，默认 `06:00`） |
 | `watchdog` / `watchdog_interval` | 掉线检测开关与间隔（分钟数，或 `5s` 这样的秒数） |
 | `probe` / `probe_url` | 外网检测开关（默认开）与自定义检测地址（list，须返回 HTTP 204） |

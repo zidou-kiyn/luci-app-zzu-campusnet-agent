@@ -517,9 +517,12 @@ return view.extend({
         var s = m.section(form.NamedSection, 'config', 'zzucampusnetagent');
         var o;
 
-        o = s.option(form.Value, 'baseurl', '服务器地址 (Base URL)', '认证服务器地址，默认 172.16.4.14，无需带 http:// 与端口');
-        o.placeholder = '172.16.4.14';
-        o.default = '172.16.4.14';
+        o = s.option(form.Value, 'baseurl', '服务器地址 (Base URL)',
+            '按校区选择认证服务器，也可填写其它域名或 IP（可直接粘贴浏览器里认证页的地址；接口走 HTTPS，默认端口 802）');
+        o.value('portal1.zzu.edu.cn', '荷园 / 柳园（portal1.zzu.edu.cn）');
+        o.value('portal2.zzu.edu.cn', '松园（portal2.zzu.edu.cn）');
+        o.placeholder = 'portal1.zzu.edu.cn';
+        o.default = 'portal1.zzu.edu.cn';
 
         o = s.option(form.Flag, 'auto_relogin', '每天定时重新授权',
             '到点对所有线路执行：若在线则先注销，间隔 1 秒后重新登录，保证授权不掉线');
@@ -1007,7 +1010,11 @@ LOCK="/var/lock/zzucampusnetagent.lock"
 MLOCK="/var/lock/zzucampusnetagent.migrate.lock"
 
 cfg() { uci -q get "${CFG}.config.$1" 2>/dev/null; }
-base() { local b; b=$(cfg baseurl); echo "${b:-172.16.4.14}"; }
+
+# 认证服务器：baseurl 填域名或 IP（也可直接粘贴浏览器地址 https://portal1.zzu.edu.cn/），
+# 只取主机[:端口]，接口走 HTTPS，默认端口 802
+PHOST=$(cfg baseurl); PHOST=${PHOST:-portal1.zzu.edu.cn}; PHOST=${PHOST#*://}; PHOST=${PHOST%%/*}
+case "$PHOST" in *:*) PPORT=${PHOST##*:}; PHOST=${PHOST%%:*} ;; *) PPORT=802 ;; esac
 
 # 线路 id 合法性（防注入）：只允许字母数字下划线
 valid_id() { case "$1" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
@@ -1141,21 +1148,46 @@ resolve_bind() {
 	return 1
 }
 
-# fetch URL [源IP]
+# 认证服务器域名解析：校内域名只有校园网 DNS 能解析，而路由器常改用公共 DNS（peerdns=0），
+# 因此先问各接口 DHCP 下发但未启用的 DNS，再问系统 DNS。结果缓存 PROBE_DNS_TTL 分钟，
+# 解析失败时沿用旧记录（并顺延，避免每次请求都等 DNS 超时）；全部失败则交给 curl 自己解析
+PORTAL_DNS="/var/run/zzucampusnetagent/portal_dns"
+portal_ip() {
+	local ip s tmp
+	case "$PHOST" in *[!0-9.]*) ;; *) echo "$PHOST"; return ;; esac
+	if [ -n "$(find "$PORTAL_DNS" -mmin -"$PROBE_DNS_TTL" 2>/dev/null)" ]; then
+		ip=$(awk -v h="$PHOST" '$1==h {print $2; exit}' "$PORTAL_DNS")
+		[ -n "$ip" ] && { echo "$ip"; return; }
+	fi
+	for s in $(ubus call network.interface dump 2>/dev/null |
+			jsonfilter -e '@.interface[*].inactive["dns-server"][*]' 2>/dev/null | awk '!a[$0]++') ""; do
+		ip=$(resolve4 "$PHOST" $s); [ -n "$ip" ] && break
+	done
+	mkdir -p "${PORTAL_DNS%/*}"
+	if [ -n "$ip" ]; then
+		tmp=$(mktemp "$PORTAL_DNS.XXXXXX") && echo "$PHOST $ip" > "$tmp" && mv -f "$tmp" "$PORTAL_DNS"
+	else
+		ip=$(awk -v h="$PHOST" '$1==h {print $2; exit}' "$PORTAL_DNS" 2>/dev/null)
+		[ -n "$ip" ] && touch "$PORTAL_DNS"
+	fi
+	echo "$ip"
+}
+
+# fetch 接口路径 [源IP]（如 fetch custom）
+# 不校验证书：开机时钟未同步、缺 CA 证书包、按 IP 访问都会导致校验失败而无法认证
 fetch() {
-	local ref ua
-	ref="http://$(base)/"
+	local url ref ua ip
+	url="https://$PHOST:$PPORT/eportal/portal/$1"
+	ref="https://$PHOST/"
 	ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 	if command -v curl >/dev/null 2>&1; then
-		if [ -n "$2" ]; then
-			curl -s --max-time 8 --interface "$2" -A "$ua" -e "$ref" "$1" 2>/dev/null
-		else
-			curl -s --max-time 8 -A "$ua" -e "$ref" "$1" 2>/dev/null
-		fi
+		ip=$(portal_ip)
+		curl -sk --max-time 8 ${ip:+--resolve "$PHOST:$PPORT:$ip"} ${2:+--interface "$2"} \
+			-A "$ua" -e "$ref" "$url" 2>/dev/null
 	elif command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -q -T 8 -U "$ua" -O - "$1" 2>/dev/null
+		uclient-fetch -q -T 8 --no-check-certificate -U "$ua" -O - "$url" 2>/dev/null
 	else
-		wget -q -O - "$1" 2>/dev/null
+		wget -q --no-check-certificate -O - "$url" 2>/dev/null
 	fi
 }
 
@@ -1174,9 +1206,9 @@ probe_urls() { local u; u=$(cfg probe_url); echo "${u:-$PROBE_URLS_DEFAULT}"; }
 PROBE_DNS="/var/run/zzucampusnetagent/probe_dns"
 PROBE_DNS_TTL=10
 
-# 解析为第一个 IPv4（BusyBox nslookup 输出中 Name: 之后的 Address 行）
+# resolve4 主机 [DNS服务器]：解析为第一个 IPv4（BusyBox nslookup 输出中 Name: 之后的 Address 行）
 resolve4() {
-	nslookup "$1" 2>/dev/null | awk '/^Name:/{n=1} n && /^Address/{sub(/^Address[ 0-9]*: */,""); if ($1 ~ /^[0-9.]+$/) {print $1; exit}}'
+	if command -v timeout >/dev/null 2>&1; then timeout 3 nslookup "$@"; else nslookup "$@"; fi 2>/dev/null | awk '/^Name:/{n=1} n && /^Address/{sub(/^Address[ 0-9]*: */,""); if ($1 ~ /^[0-9.]+$/) {print $1; exit}}'
 }
 
 probe_dns_refresh() {
@@ -1361,7 +1393,7 @@ add_query_fields() {
 		return
 	fi
 	json_add_string bind "$BIND"
-	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
+	raw=$(fetch custom "$BIND")
 	if [ -z "$raw" ]; then
 		json_add_string status "error"
 		json_add_string msg "无法连接认证服务器（确认路由器已接入校园网）"
@@ -1401,7 +1433,7 @@ add_query_fields() {
 query_state() {
 	local raw json
 	resolve_bind "$1" || { echo "error"; return; }
-	raw=$(fetch "http://$(base):801/eportal/portal/custom" "$BIND")
+	raw=$(fetch custom "$BIND")
 	[ -z "$raw" ] && { echo "error"; return; }
 	json=$(strip_jsonp "$raw")
 	case "$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)" in
@@ -1459,7 +1491,7 @@ cmd_status() {
 }
 
 cmd_login() {
-	local id="$1" account password suffix acct pwb64 url raw json result msg
+	local id="$1" account password suffix acct pwb64 raw json result msg
 	line_exists "$id" || { bad_line "$id"; return; }
 	account=$(lget "$id" account)
 	password=$(lget "$id" password)
@@ -1479,8 +1511,7 @@ cmd_login() {
 	fi
 	acct=$(urlencode ",0,${account}${suffix}")
 	pwb64=$(urlencode "$(b64 "$password")")
-	url="http://$(base):801/eportal/portal/login?user_account=${acct}&user_password=${pwb64}"
-	raw=$(fetch "$url" "$BIND")
+	raw=$(fetch "login?user_account=${acct}&user_password=${pwb64}" "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
@@ -1500,7 +1531,7 @@ cmd_logout() {
 		json_add_string msg "$ERR"
 		json_dump; return
 	fi
-	raw=$(fetch "http://$(base):801/eportal/portal/logout" "$BIND")
+	raw=$(fetch logout "$BIND")
 	json=$(strip_jsonp "$raw")
 	result=$(jsonfilter -s "$json" -e '@.result' 2>/dev/null)
 	msg=$(jsonfilter -s "$json" -e '@.msg' 2>/dev/null)
@@ -2292,7 +2323,8 @@ ZZU_EOF_ACL
 if [ ! -f "$CFG" ]; then
 cat > "$CFG" <<'ZZU_EOF_CFG'
 config zzucampusnetagent 'config'
-	option baseurl '172.16.4.14'
+	# 认证服务器：荷园/柳园 portal1.zzu.edu.cn，松园 portal2.zzu.edu.cn
+	option baseurl 'portal1.zzu.edu.cn'
 	option auto_relogin '0'
 	option relogin_time '06:00'
 	option watchdog '0'
@@ -2334,7 +2366,7 @@ fi
 
 uci -q get zzucampusnetagent.config >/dev/null 2>&1 || uci set zzucampusnetagent.config=zzucampusnetagent
 add_def() { uci -q get "zzucampusnetagent.config.$1" >/dev/null 2>&1 || uci set "zzucampusnetagent.config.$1=$2"; }
-add_def baseurl 172.16.4.14
+add_def baseurl portal1.zzu.edu.cn
 add_def auto_relogin 0
 add_def relogin_time 06:00
 add_def watchdog 0
