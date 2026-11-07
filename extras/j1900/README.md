@@ -91,7 +91,7 @@ AX5400 上的校园网插件、AdGuard Home、SQM 等软件包，切换后可以
 |---|---|
 | 校园网插件 | 4 线认证、5 秒看门狗、外网检测、故障线路摘除；06:00 全部重认证；设备监控（lan + lanct，保留 30 天） |
 | 多线聚合 | `/etc/hotplug.d/iface/99-multipath`，按连接哈希（`fib_multipath_hash_policy=1`） |
-| AdGuard Home | 监听 :53，上游阿里 / 腾讯 DoH + DoT，`.lan` 和反查交给 `127.0.0.1:54`；规则 AdGuard DNS filter + anti-AD |
+| AdGuard Home | 监听 :53，上游阿里 / 腾讯 DoH + DoT，`.lan` 和反查交给 `127.0.0.1:54`，认证页域名 `portal1` / `portal2.zzu.edu.cn` 交给校园网 DNS `202.196.64.1`（公共 DNS 解析不到，局域网打开认证页会空白；DHCP 下发的另一个 `10.10.8.8` 也解析不到）；规则 AdGuard DNS filter + anti-AD |
 | dnsmasq | 端口 **54**，只做 DHCP 和 `.lan` 本地解析；**`dns_redirect` 必须为 0**（否则查询被劫持到 54，返回 REFUSED） |
 | DNS 劫持 | 防火墙 `Hijack-DNS-lan` / `Hijack-DNS-lanct`：发往其他服务器的明文 53 → AdGuard（DoH / DoT 不受影响） |
 | 防火墙 | 软件 + 硬件流量卸载、FullCone NAT |
